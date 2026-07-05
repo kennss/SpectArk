@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://spectark.calidalab.ai/sitemap.xml

@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<!--
+  @file        index.html
+  @description SpectArk landing page (spectark.calidalab.ai). Static, dark brand
+               (blue + amber) shared across the Calida Lab / Specta product family.
+  @author      Kennt Kim
+  @company     Calida Lab
+  @created     2026-07-05
+  @lastUpdated 2026-07-05
+-->
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>SpectArk — Back up the moment it changes.</title>
+  <meta name="description" content="A native macOS incremental backup app. SpectArk watches the folders you actually care about and snapshots them the instant a file changes — versioned like Time Machine, to any disk or NAS, optionally end-to-end encrypted. Free & open source." />
+  <link rel="icon" type="image/png" href="/assets/icon.png" />
+  <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+
+  <!-- Open Graph / social -->
+  <meta property="og:type" content="website" />
+  <meta property="og:title" content="SpectArk — Back up the moment it changes." />
+  <meta property="og:description" content="Realtime, folder-scoped, versioned backup for Mac — optionally end-to-end encrypted. To any disk or NAS. Free & open source." />
+  <meta property="og:image" content="https://spectark.calidalab.ai/assets/icon.png" />
+  <meta property="og:url" content="https://spectark.calidalab.ai/" />
+  <meta property="og:locale" content="en_US" />
+  <meta name="theme-color" content="#0c111b" />
+
+  <link rel="canonical" href="https://spectark.calidalab.ai/" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,600;12..96,800&family=Inter:wght@400;500;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/styles.css?v=1" />
+</head>
+<body>
+
+  <!-- NAV -->
+  <header class="nav">
+    <a class="nav__brand" href="#top" aria-label="SpectArk">
+      <img src="/assets/lockup-white.png" srcset="/assets/lockup-white.png 1x, /assets/lockup-white@2x.png 2x" alt="SpectArk" height="28" />
+    </a>
+    <nav class="nav__links">
+      <a href="#realtime">Realtime</a>
+      <a href="#versions">Versions</a>
+      <a href="#anywhere">Anywhere</a>
+      <a href="#encryption">Encryption</a>
+    </nav>
+    <a class="btn btn--small" href="#download">Download</a>
+  </header>
+
+  <!-- HERO -->
+  <main id="top">
+    <section class="hero">
+      <img class="hero__icon" src="/assets/icon.png" alt="SpectArk app icon" width="128" height="128" />
+      <span class="badge"><span class="badge__spark">✦</span> Snapshots the instant a file changes</span>
+      <h1 class="hero__title">Back up the moment<br />it <span class="amber">changes</span>.</h1>
+      <p class="hero__sub">
+        SpectArk watches the folders you actually care about and snapshots them the
+        <strong>instant a file changes</strong> — versioned like Time Machine, to any disk or NAS,
+        optionally <strong>end-to-end encrypted</strong>. No schedule, no gap.
+      </p>
+      <div class="hero__cta">
+        <a class="btn btn--primary" href="https://github.com/kennss/SpectArk/releases/latest" target="_blank" rel="noopener">Download for Mac</a>
+        <a class="btn btn--ghost" href="#realtime">See how it works ↓</a>
+      </div>
+      <p class="hero__note">macOS 14+ · Apple Silicon &amp; Intel · Free &amp; open source (MIT)</p>
+    </section>
+
+    <!-- HERO SCREENSHOT -->
+    <section class="hero-shot" aria-label="SpectArk on Mac">
+      <div class="frame frame--wide">
+        <img src="/assets/screenshots/home-mac.png" alt="SpectArk on Mac — a realtime backup job showing live throughput, files this pass, and destination free space"
+             onerror="this.closest('.hero-shot').remove()" />
+      </div>
+    </section>
+
+    <!-- FEATURE: REALTIME -->
+    <section id="realtime" class="feature">
+      <div class="feature__text">
+        <p class="kicker kicker--blue">Realtime backup</p>
+        <h2>The instant you<br />hit save.</h2>
+        <p>
+          Point SpectArk at the folder you're actively working in and it snapshots the moment a file
+          changes — no schedule, no interval to tune. It closes the gap a scheduled backup always leaves,
+          and the one Git leaves too: your work <em>between</em> commits is safe the second you type it.
+        </p>
+        <ul class="checks">
+          <li>Watches folders live with FSEvents — snapshots on change</li>
+          <li>Or run on an interval, per backup — you choose</li>
+          <li>Menu-bar app with live throughput, free space &amp; last backup</li>
+          <li>Resumes automatically if a backup is interrupted</li>
+        </ul>
+      </div>
+      <figure class="feature__art art--blue">
+        <img src="/assets/screenshots/realtime.png" alt="SpectArk's menu-bar dropdown — every backup with its last-run time and each destination's free space, always watching"
+             onerror="this.closest('.feature__art').classList.add('feature__art--empty'); this.remove()" />
+      </figure>
+    </section>
+
+    <!-- FEATURE: VERSIONED HISTORY -->
+    <section id="versions" class="feature feature--reverse">
+      <div class="feature__text">
+        <p class="kicker kicker--amber">Versioned history</p>
+        <h2>Every version,<br />browsable in Finder.</h2>
+        <p>
+          SpectArk keeps point-in-time snapshots the way Time Machine does — but only of the folders you
+          chose, so restoring is instant and the history stays small. Unchanged files are shared with
+          APFS clones and hardlinks, so a snapshot costs almost nothing.
+        </p>
+        <ul class="checks">
+          <li>Point-in-time snapshots, Time Machine style</li>
+          <li>Unchanged data shared via APFS clones / hardlinks — near-zero cost</li>
+          <li>Snapshots stay plain files — browse and restore right in Finder</li>
+          <li>Automatic thinning keeps the history tidy over time</li>
+        </ul>
+      </div>
+      <figure class="feature__art art--amber">
+        <img src="/assets/screenshots/versions.png" alt="A snapshot history — point-in-time versions of a backed-up folder"
+             onerror="this.closest('.feature__art').classList.add('feature__art--empty'); this.remove()" />
+      </figure>
+    </section>
+
+    <!-- FEATURE: ANY SOURCE → ANY DESTINATION -->
+    <section id="anywhere" class="feature">
+      <div class="feature__text">
+        <p class="kicker kicker--blue">Just what matters. Anywhere you like.</p>
+        <h2>Any folder.<br />Any drive.</h2>
+        <p>
+          No whole-system copy, no dedicated backup drive. Back up just the source code and projects you
+          can't reinstall, and pair any source folder with any destination — an external SSD, a spare
+          partition, or a NAS. SpectArk detects each destination's capabilities and picks the safe
+          strategy automatically.
+        </p>
+        <ul class="checks">
+          <li>Folder-scoped — back up what you can't re-download, skip the OS</li>
+          <li>Local disk or NAS (SMB) — strategy auto-detected per destination</li>
+          <li>Multiple source folders, each paired with its own destination</li>
+          <li>No drive dedicated to backups — snapshots live where you want</li>
+        </ul>
+      </div>
+      <figure class="feature__art art--learn">
+        <img src="/assets/screenshots/anywhere.png" alt="Pairing a source folder with any destination — external disk or NAS"
+             onerror="this.closest('.feature__art').classList.add('feature__art--empty'); this.remove()" />
+      </figure>
+    </section>
+
+    <!-- FEATURE: ENCRYPTION -->
+    <section id="encryption" class="feature feature--reverse">
+      <div class="feature__text">
+        <p class="kicker kicker--amber">Optional end-to-end encryption</p>
+        <h2>The backup shouldn't<br />become the leak.</h2>
+        <p>
+          A backup drive or NAS can be lost or stolen — and a plaintext copy hands over every file on it.
+          So any backup can be encrypted end-to-end, unlocked only by your password, with a one-time
+          recovery key as a fallback. It's off by default: when you don't need it, snapshots stay
+          browsable plaintext.
+        </p>
+        <ul class="checks">
+          <li>AES-256-GCM with argon2id-derived keys</li>
+          <li>Content-defined chunking + dedup — encrypted, still efficient</li>
+          <li>One-time recovery key so you're never locked out</li>
+          <li>Opt-in per backup — plaintext stays browsable when you don't need it</li>
+        </ul>
+      </div>
+      <figure class="feature__art art--sources">
+        <img src="/assets/screenshots/encryption.png" alt="Turning on end-to-end encryption for a backup — AES-256-GCM with a one-time recovery key"
+             onerror="this.closest('.feature__art').classList.add('feature__art--empty'); this.remove()" />
+      </figure>
+    </section>
+
+    <!-- SMALL FEATURE GRID -->
+    <section class="grid">
+      <div class="grid__item">
+        <h3>Built for correctness</h3>
+        <p>APFS source snapshots for consistent reads, <code>clonefile</code>/<code>copyfile</code>, atomic <code>rename</code> publish with a <code>COMPLETE</code> marker, and an <code>F_FULLFSYNC</code>-durable SQLite catalog. The filesystem is the source of truth.</p>
+      </div>
+      <div class="grid__item">
+        <h3>Yours, entirely</h3>
+        <p>Free and open source (MIT). No account, no telemetry, no cloud. Developer ID signed and notarized by Apple, and it keeps itself up to date in place.</p>
+      </div>
+    </section>
+
+    <!-- PLATFORM -->
+    <section class="platforms">
+      <h2>One Mac app. Menu bar + dashboard.</h2>
+      <p class="platforms__sub">Native on Apple Silicon and Intel.</p>
+      <div class="platforms__row">
+        <span class="chip">Apple Silicon</span>
+        <span class="chip">Intel</span>
+        <span class="chip">macOS 14+</span>
+      </div>
+    </section>
+
+    <!-- DOWNLOAD -->
+    <section id="download" class="download">
+      <h2>Download SpectArk</h2>
+      <p>Free and open source. Grab the latest signed, notarized DMG — open it and drag SpectArk to Applications.</p>
+      <div class="download__btns">
+        <a class="btn btn--primary" href="https://github.com/kennss/SpectArk/releases/latest" target="_blank" rel="noopener">Download for Mac</a>
+        <a class="btn btn--ghost" href="https://github.com/kennss/SpectArk" target="_blank" rel="noopener">View on GitHub</a>
+      </div>
+      <p class="download__note">Signed &amp; notarized · Universal · macOS 14+ · in-app auto-update.</p>
+    </section>
+  </main>
+
+  <!-- FOOTER -->
+  <footer class="footer">
+    <img src="/assets/wordmark-white.png" srcset="/assets/wordmark-white.png 1x, /assets/wordmark-white@2x.png 2x" alt="SpectArk" height="22" class="footer__mark" />
+    <p class="footer__desc">Realtime, folder-scoped, versioned backup for Mac — optionally end-to-end encrypted.</p>
+    <p class="footer__meta">
+      <a href="https://github.com/kennss/SpectArk" target="_blank" rel="noopener">GitHub</a>
+      <span>·</span>
+      <a href="/privacy/">Privacy</a>
+      <span>·</span>
+      <a href="mailto:kenntkim66@gmail.com">kenntkim66@gmail.com</a>
+      <span>·</span>
+      <span>© 2026 Calida Lab</span>
+    </p>
+  </footer>
+
+</body>
+</html>

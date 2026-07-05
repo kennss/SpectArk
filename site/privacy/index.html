@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Privacy Policy — SpectArk</title>
+  <meta name="description" content="SpectArk's privacy policy. SpectArk runs entirely on your Mac and does not collect or transmit your personal data. Your files are only ever copied to the backup destination you choose." />
+  <link rel="icon" type="image/png" href="/assets/icon.png" />
+  <meta name="robots" content="index, follow" />
+  <meta name="theme-color" content="#0c111b" />
+
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,600;12..96,800&family=Inter:wght@400;500;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/styles.css?v=1" />
+  <style>
+    .legal { max-width: 760px; margin: 0 auto; padding: 56px 24px 30px; }
+    .legal h1 { font-family: "Bricolage Grotesque", "Inter", sans-serif; font-weight: 800; font-size: clamp(32px, 5vw, 46px); letter-spacing: -0.01em; margin-bottom: 8px; }
+    .legal .updated { color: var(--ink-faint); font-size: 14px; margin-bottom: 30px; }
+    .legal h2 { font-size: 20px; margin: 34px 0 10px; }
+    .legal p { color: var(--ink-dim); font-size: 16px; line-height: 1.75; margin-bottom: 12px; }
+    .legal ul { margin: 8px 0 14px; padding-left: 22px; }
+    .legal li { color: var(--ink-dim); font-size: 16px; line-height: 1.7; margin-bottom: 10px; }
+    .legal strong { color: var(--ink); font-weight: 600; }
+    .legal a { color: var(--blue); }
+    .legal__lede { color: var(--ink); font-size: 18px; }
+  </style>
+</head>
+<body>
+
+  <!-- NAV -->
+  <header class="nav">
+    <a class="nav__brand" href="/" aria-label="SpectArk">
+      <img src="/assets/lockup-white.png" srcset="/assets/lockup-white.png 1x, /assets/lockup-white@2x.png 2x" alt="SpectArk" height="28" />
+    </a>
+    <nav class="nav__links" style="margin-left:auto">
+      <a href="/">← Home</a>
+    </nav>
+  </header>
+
+  <main class="legal">
+    <h1>Privacy Policy</h1>
+    <p class="updated">Last updated: July 5, 2026</p>
+
+    <p class="legal__lede">
+      SpectArk is a local backup app. It runs entirely on your Mac and does not collect, store, or
+      transmit your personal data to us. There are no SpectArk accounts and no SpectArk servers that
+      receive your files or activity.
+    </p>
+
+    <h2>What SpectArk does with your files</h2>
+    <ul>
+      <li>SpectArk reads the source folders you select and copies them to the backup destination <strong>you</strong> choose — a local disk or a NAS on your own network. That is the app's entire purpose.</li>
+      <li>Everything happens on your Mac. Your files, snapshots, and the SQLite catalog stay on your machine and your destination. They are never sent to us.</li>
+      <li>If you enable encryption, keys are derived from your password (argon2id) and content is encrypted locally with AES-256-GCM. Your password and recovery key never leave your Mac; we cannot recover them for you.</li>
+    </ul>
+
+    <h2>Full Disk Access</h2>
+    <p>
+      Because macOS protects folders like Desktop and Documents, SpectArk asks for <strong>Full Disk
+      Access</strong> so it can read the files you want to back up. That permission is granted by you in
+      System Settings and is used solely to copy your selected folders to your chosen destination.
+    </p>
+
+    <h2>Information we do not collect</h2>
+    <ul>
+      <li>We do not collect personal information, usage analytics, telemetry, advertising identifiers, or your contacts.</li>
+      <li>SpectArk has no login and operates no servers that receive your files, backups, or activity.</li>
+    </ul>
+
+    <h2>Network access</h2>
+    <p>
+      SpectArk's only outbound connection is the <strong>automatic update check</strong>: it fetches a
+      signed release feed (appcast) from GitHub to see whether a newer version is available, and
+      downloads the update if you choose to install it. This request goes to GitHub and includes only
+      what a normal download requires (such as your IP address and app version); it carries none of your
+      files or backup content. Backing up to a NAS communicates only with the destination on your own
+      network. You can disable automatic update checks in the app.
+    </p>
+
+    <h2>Third parties</h2>
+    <p>
+      Update checks and downloads are served by <a href="https://github.com" target="_blank" rel="noopener">GitHub</a>,
+      subject to their privacy policy. SpectArk itself shares nothing else with any third party.
+    </p>
+
+    <h2>Children's privacy</h2>
+    <p>SpectArk is a general-purpose utility and is not directed to children. It collects no personal information from anyone.</p>
+
+    <h2>Changes to this policy</h2>
+    <p>If this policy changes, the updated date above will change and the new version will be posted on this page.</p>
+
+    <h2>Contact</h2>
+    <p>Questions? Email <a href="mailto:kenntkim66@gmail.com">kenntkim66@gmail.com</a>.</p>
+  </main>
+
+  <footer class="footer">
+    <img src="/assets/wordmark-white.png" srcset="/assets/wordmark-white.png 1x, /assets/wordmark-white@2x.png 2x" alt="SpectArk" height="22" class="footer__mark" />
+    <p class="footer__meta">
+      <a href="https://github.com/kennss/SpectArk" target="_blank" rel="noopener">GitHub</a>
+      <span>·</span>
+      <a href="mailto:kenntkim66@gmail.com">kenntkim66@gmail.com</a>
+      <span>·</span>
+      <span>© 2026 Calida Lab</span>
+    </p>
+  </footer>
+</body>
+</html>
