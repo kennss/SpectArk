@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<!--
+  @file        1.1.4.html
+  @description Sparkle in-app release notes for SpectArk 1.1.4. Bundled into the appcast by
+               scripts/release.sh (copied next to the DMG as SpectArk-1.1.4.html so generate_appcast
+               attaches it). Rendered in the "Update Available" panel; styled for light and dark.
+  @author      Kennt Kim
+  @company     Calida Lab
+  @created     2026-07-05
+  @lastUpdated 2026-07-05
+-->
+<html>
+<head>
+<meta charset="utf-8" />
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    font: 13px -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif;
+    line-height: 1.5; margin: 0; padding: 14px 16px;
+    color: #1d1d1f; background: transparent;
+  }
+  h1 { font-size: 15px; font-weight: 700; margin: 0 0 4px; }
+  .sub { color: #86868b; font-size: 12px; margin: 0 0 12px; }
+  ul { margin: 0; padding-left: 18px; }
+  li { margin-bottom: 9px; }
+  b { font-weight: 600; }
+  @media (prefers-color-scheme: dark) {
+    body { color: #f5f5f7; }
+    .sub { color: #98989d; }
+  }
+</style>
+</head>
+<body>
+  <h1>SpectArk 1.1.4</h1>
+  <p class="sub">Quality-of-life improvements</p>
+  <ul>
+    <li><b>Right-click any backup</b> in the sidebar to reach its actions — Back Up Now,
+        Restore, Settings, Remove — without having to select it first.</li>
+    <li><b>Click a backup's source or destination</b> to open it in Finder. The destination
+        opens straight to that backup's snapshot folders, so your point-in-time versions are
+        one click away.</li>
+  </ul>
+</body>
+</html>

@@ -7,7 +7,7 @@
 //  @author      Kennt Kim
 //  @company     Calida Lab
 //  @created     2026-06-29
-//  @lastUpdated 2026-07-01
+//  @lastUpdated 2026-07-05
 //
 
 import SwiftUI
@@ -202,6 +202,7 @@ private struct JobRow: View {
     var onSettings: () -> Void
     var onRestore: () -> Void
     var onRemove: () -> Void
+    @State private var hovering = false
 
     var body: some View {
         HStack(spacing: 8) {
@@ -226,19 +227,13 @@ private struct JobRow: View {
             }
             Spacer(minLength: 4)
             Menu {
-                Button { coordinator.runNow(job.id) } label: { Label("Back Up Now", systemImage: "arrow.clockwise") }
-                    .disabled(state.isRunning)
-                Button(action: onRestore) { Label("Restore…", systemImage: "clock.arrow.circlepath") }
-                    .disabled(state.history.isEmpty)
-                Button(action: onSettings) { Label("Settings…", systemImage: "gearshape") }
-                Divider()
-                Button(role: .destructive, action: onRemove) {
-                    Label("Remove", systemImage: "trash")
-                }
+                actions
             } label: {
                 Image(systemName: "ellipsis")
                     .foregroundStyle(.secondary)
-                    .frame(width: 24, height: 24)
+                    .frame(width: 26, height: 22)
+                    .background(hovering ? Color.secondary.opacity(0.18) : .clear,
+                                in: RoundedRectangle(cornerRadius: 5, style: .continuous))
                     .contentShape(Rectangle())
             }
             .menuStyle(.borderlessButton)
@@ -246,6 +241,24 @@ private struct JobRow: View {
             .fixedSize()
         }
         .padding(.vertical, 2)
+        .contentShape(Rectangle())
+        .onHover { hovering = $0 }
+        // Right-click any row for its actions — no need to select the job first.
+        .contextMenu { actions }
+    }
+
+    /// Per-job actions, shared by the row's ⋯ menu and its right-click context menu,
+    /// so they're reachable whether or not the row is selected.
+    @ViewBuilder private var actions: some View {
+        Button { coordinator.runNow(job.id) } label: { Label("Back Up Now", systemImage: "arrow.clockwise") }
+            .disabled(state.isRunning)
+        Button(action: onRestore) { Label("Restore…", systemImage: "clock.arrow.circlepath") }
+            .disabled(state.history.isEmpty)
+        Button(action: onSettings) { Label("Settings…", systemImage: "gearshape") }
+        Divider()
+        Button(role: .destructive, action: onRemove) {
+            Label("Remove", systemImage: "trash")
+        }
     }
 
     /// Lock only when encryption is ON and NO plaintext snapshots remain (fully encrypted). A job with

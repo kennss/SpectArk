@@ -20,7 +20,7 @@
 # @author      Kennt Kim
 # @company     Calida Lab
 # @created     2026-06-30
-# @lastUpdated 2026-07-01
+# @lastUpdated 2026-07-05
 #
 set -euo pipefail
 
@@ -114,6 +114,17 @@ if [ "${NOTARIZE}" = "1" ]; then
     APPCAST_DIR="${BUILD_DIR}/appcast"
     rm -rf "${APPCAST_DIR}"; mkdir -p "${APPCAST_DIR}"
     cp "${DMG}" "${APPCAST_DIR}/"
+    # Release notes for Sparkle's in-app "What's New" panel. generate_appcast attaches an HTML file
+    # whose name matches the archive (SpectArk-<version>.html beside SpectArk-<version>.dmg). Drop a
+    # docs/release-notes/<version>.html and it flows into the appcast automatically.
+    NOTES_SRC="docs/release-notes/${VERSION}.html"
+    if [ -f "${NOTES_SRC}" ]; then
+      cp "${NOTES_SRC}" "${APPCAST_DIR}/${APP_NAME}-${VERSION}.html"
+      cp "${NOTES_SRC}" "${BUILD_DIR}/${APP_NAME}-${VERSION}.html"
+      echo "==> Bundled release notes from ${NOTES_SRC}"
+    else
+      echo "WARN: no ${NOTES_SRC} — in-app update will show no release notes"
+    fi
     "${APPCAST_TOOL}" --download-url-prefix "https://github.com/kennss/SpectArk/releases/download/v${VERSION}/" "${APPCAST_DIR}"
     cp "${APPCAST_DIR}/appcast.xml" "${BUILD_DIR}/appcast.xml"
     echo "==> appcast: ${BUILD_DIR}/appcast.xml"

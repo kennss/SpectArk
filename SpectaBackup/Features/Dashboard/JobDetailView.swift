@@ -7,10 +7,11 @@
 //  @author      Kennt Kim
 //  @company     Calida Lab
 //  @created     2026-06-29
-//  @lastUpdated 2026-07-01
+//  @lastUpdated 2026-07-05
 //
 
 import SwiftUI
+import AppKit
 
 struct JobDetailView: View {
     @Environment(AppModel.self) private var model
@@ -94,6 +95,7 @@ struct JobDetailView: View {
             folderBadge(icon: "folder.fill",
                         name: job.sources.first?.lastPathComponent ?? "—",
                         path: job.sources.first?.path ?? "—",
+                        url: job.sources.first,
                         tint: .secondary)
             VStack(spacing: 4) {
                 Image(systemName: state.isRunning ? "arrow.right.circle.fill" : "arrow.right")
@@ -104,20 +106,48 @@ struct JobDetailView: View {
             folderBadge(icon: "externaldrive.fill",
                         name: job.destination.lastPathComponent,
                         path: job.destination.path,
+                        url: destinationRevealURL,
                         tint: .wpDesignYellow)
         }
     }
 
-    private func folderBadge(icon: String, name: String, path: String, tint: Color) -> some View {
-        VStack(spacing: 6) {
-            Image(systemName: icon).font(.system(size: 30)).foregroundStyle(tint)
-            Text(name).font(.callout.weight(.medium)).lineLimit(1)
-            Text(path).font(.caption2).foregroundStyle(.secondary)
-                .lineLimit(1).truncationMode(.middle)
+    /// Source / destination card. Clicking it opens that folder in Finder (Time Machine / CCC style),
+    /// so the backed-up drive is one click away. Disabled when there's no path (e.g. no source set).
+    private func folderBadge(icon: String, name: String, path: String, url: URL?, tint: Color) -> some View {
+        Button {
+            if let url { NSWorkspace.shared.open(url) }
+        } label: {
+            VStack(spacing: 6) {
+                Image(systemName: icon).font(.system(size: 30)).foregroundStyle(tint)
+                Text(name).font(.callout.weight(.medium)).lineLimit(1)
+                Text(path).font(.caption2).foregroundStyle(.secondary)
+                    .lineLimit(1).truncationMode(.middle)
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 16)
+            .cardSurface()
+            .contentShape(Rectangle())
         }
-        .frame(maxWidth: .infinity)
-        .padding(.vertical, 16)
-        .cardSurface()
+        .buttonStyle(.plain)
+        .disabled(url == nil)
+        .help(url == nil ? "" : "Open “\(name)” in Finder")
+        .onHover { inside in
+            guard url != nil else { return }
+            if inside { NSCursor.pointingHand.push() } else { NSCursor.pop() }
+        }
+    }
+
+    /// Where clicking the destination card takes you in Finder: straight into this job's snapshot
+    /// folders (skipping the volume root and the opaque per-job UUID directory), so the point-in-time
+    /// backups are right there. Falls back to the job root, then the destination, when snapshots aren't
+    /// browsable — an encrypted repo, or before the first backup has run.
+    private var destinationRevealURL: URL {
+        let fm = FileManager.default
+        let root = BackupRunner.jobRoot(for: job)
+        let snapshots = root.appendingPathComponent("snapshots", isDirectory: true)
+        if !job.encryptionEnabled, fm.fileExists(atPath: snapshots.path) { return snapshots }
+        if fm.fileExists(atPath: root.path) { return root }
+        return job.destination
     }
 
     // MARK: - Status cards

@@ -4,6 +4,14 @@ All notable changes to SpectArk are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [1.1.4] — 2026-07-05
+
+### Improved
+- **Right-click any backup** in the sidebar to reach its actions — Back Up Now, Restore,
+  Settings, Remove — without having to select it first. The ⋯ button also highlights on hover.
+- **Click a backup's source or destination** card to open it in Finder. The destination card
+  opens straight to that backup's snapshot folders, so your point-in-time versions are one click away.
+
 ## [1.1.3] — 2026-07-01
 
 ### Fixed
@@ -76,6 +84,7 @@ the bundle id and existing backups carry over).
 - Dashboard window + menu-bar dropdown with live throughput and free space.
 - Developer ID signed and notarized; universal (Apple Silicon + Intel), macOS 14+.
 
+[1.1.4]: https://github.com/kennss/SpectArk/releases/tag/v1.1.4
 [1.1.3]: https://github.com/kennss/SpectArk/releases/tag/v1.1.3
 [1.1.1]: https://github.com/kennss/SpectArk/releases/tag/v1.1.1
 [1.1.0]: https://github.com/kennss/SpectArk/releases/tag/v1.1.0
