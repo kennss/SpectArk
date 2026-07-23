@@ -1,43 +1,43 @@
-# SpectArk — 브랜드 자산 (Mac · iPhone · iPad)
+# SpectArk — Brand Assets (Mac · iPhone · iPad)
 
-> Specta 시리즈 · Time Machine류 백업 앱.
-> 가족 DNA(라이트 글래스 스퀘어클 · 블루 · 앰버 · Bricolage Grotesque 폰트) 유지.
-> 아이콘: 큰 블루 시계 링 + 앰버 되감기 화살표 + **앰버 시계바늘**. 워드마크 앰버 액센트는 **"A"**.
+> Specta series · Time Machine-style backup app.
+> Keeps the family DNA (light glass squircle · blue · amber · Bricolage Grotesque font).
+> Icon: large blue clock ring + amber rewind arrow + **amber clock hands**. The wordmark's amber accent is the **"A"**.
 
-## 포함 자산
+## Included assets
 
 ```
 design_handoff_spectark/
 ├── README.md · CLAUDE_CODE_PROMPT.md
-├── AppIcon-iOS.appiconset/         iOS/iPadOS 앱 아이콘 (풀블리드, 17 사이즈)
-├── AppIcon-macOS.appiconset/       macOS 앱 아이콘 (여백+라운드, 16~1024)
-├── LaunchScreen.storyboard         iOS/iPadOS 런치 (UIImageView 1개)
-├── LaunchScreen.imageset/          권장: iPhone/iPad 다크 분기
-├── launch/                          방향별 imageset + Mac-Window 스플래시
+├── AppIcon-iOS.appiconset/         iOS/iPadOS app icon (full-bleed, 17 sizes)
+├── AppIcon-macOS.appiconset/       macOS app icon (margins + rounding, 16–1024)
+├── LaunchScreen.storyboard         iOS/iPadOS launch (single UIImageView)
+├── LaunchScreen.imageset/          recommended: iPhone/iPad dark variants
+├── launch/                          per-orientation imagesets + Mac-Window splash
 ├── wordmark/                        wordmark-{white,navy}(.2x) · lockup-{white,navy}(.2x)
 └── preview/                         app-icon-1024 · mac-icon-512 · launch-ipad-portrait
 ```
 
-## 플랫폼 적용
+## Platform mapping
 
-| 플랫폼 | 아이콘 | 런치/스플래시 |
+| Platform | Icon | Launch / splash |
 |---|---|---|
-| iOS/iPadOS | `AppIcon-iOS.appiconset` (풀블리드) | `LaunchScreen.imageset` + `LaunchScreen.storyboard` |
-| macOS | `AppIcon-macOS.appiconset` (여백+라운드) | `launch/Mac-Window.png`를 첫 윈도우 배경으로 |
+| iOS/iPadOS | `AppIcon-iOS.appiconset` (full-bleed) | `LaunchScreen.imageset` + `LaunchScreen.storyboard` |
+| macOS | `AppIcon-macOS.appiconset` (margins + rounding) | `launch/Mac-Window.png` as the first window's background |
 
-빌드 후 iOS/iPad는 **시뮬레이터 캐시 클리어**(`Erase All Content and Settings`) 필수.
+After building for iOS/iPad, a **simulator cache clear** (`Erase All Content and Settings`) is required.
 
-## 디자인 토큰
+## Design tokens
 
 | Token | Value |
 |---|---|
-| 아이콘 글래스 바디 | `#EAF1FB → #D2E0F2 → #BCD0EA` |
-| 시계 링 | `#4AA3FF → #1A6FE0` |
-| 되감기 화살표 · 시계바늘 | `#FFE066 → #F5B400` (앰버) |
-| 런치 배경 | radial `#1b2434 → #0c111b → #070a11` |
-| 워드마크 | 흰색(다크 기본)/네이비(라이트), **"A"만 앰버** |
-| 폰트 | Bricolage Grotesque ExtraBold (베이킹, 번들 불필요) |
+| Icon glass body | `#EAF1FB → #D2E0F2 → #BCD0EA` |
+| Clock ring | `#4AA3FF → #1A6FE0` |
+| Rewind arrow · clock hands | `#FFE066 → #F5B400` (amber) |
+| Launch background | radial `#1b2434 → #0c111b → #070a11` |
+| Wordmark | white (dark default) / navy (light), **only the "A" in amber** |
+| Font | Bricolage Grotesque ExtraBold (baked into images, no bundling needed) |
 
-## Specta 시리즈 일관성
-- Spectalo(재생=비디오) · SpectaLing(웨이브폼=전사) · **SpectArk(시계 되감기=백업)**
-- 같은 글래스·블루·앰버·폰트 DNA로 형제 시리즈임이 한눈에
+## Specta series consistency
+- Spectalo (play = video) · SpectaLing (waveform = transcription) · **SpectArk (clock rewind = backup)**
+- The shared glass · blue · amber · font DNA makes them read as siblings at a glance
