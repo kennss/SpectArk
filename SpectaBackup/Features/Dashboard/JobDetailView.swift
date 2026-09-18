@@ -7,7 +7,7 @@
 //  @author      Kennt Kim
 //  @company     Calida Lab
 //  @created     2026-06-29
-//  @lastUpdated 2026-09-18
+//  @lastUpdated 2026-09-19
 //
 
 import SwiftUI
@@ -26,6 +26,7 @@ struct JobDetailView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
                 sourceDestinationHeader
+                if showsLoginPrompt { loginPrompt }
                 if state.isMigrating { migrationBanner }
                 else if let msg = state.migrationMessage { migrationDoneBanner(msg) }
                 else if job.encryptionEnabled, plaintextCount > 0 { migrationPrompt }
@@ -230,7 +231,7 @@ struct JobDetailView: View {
     private func caption(for point: RestorePoint) -> String {
         let size = "\(point.fileCount) files · \(byteString(point.bytes))"
         switch point.source {
-        case .latest: return size + " · Latest — becomes a restore point within 15 minutes"
+        case .latest: return size + " · Latest"
         case .checkpoint: return size
         case .legacySnapshot: return size + " · Earlier snapshot"
         case .encryptedSnapshot: return size + " · Encrypted"
@@ -238,6 +239,39 @@ struct JobDetailView: View {
     }
 
     // MARK: - Helpers
+
+    // MARK: - Open at login
+
+    @AppStorage("spectark.loginPromptDismissed") private var loginPromptDismissed = false
+
+    /// Offered once, on a job that runs on changes: without it, a restart ends realtime backup until the
+    /// app is opened again.
+    private var showsLoginPrompt: Bool {
+        !loginPromptDismissed && job.isEnabled && job.trigger == .realtime
+            && !LoginItem.shared.isEnabled && !LoginItem.shared.needsApproval
+    }
+
+    private var loginPrompt: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "power.circle")
+                .font(.title3).foregroundStyle(Color.wpDesignYellow)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Keep backing up after a restart").font(.callout.weight(.medium))
+                Text("Realtime backup runs only while SpectArk is open. Open it at login — it starts quietly in the menu bar.")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer()
+            Button("Not Now") { loginPromptDismissed = true }
+                .controlSize(.small)
+            Button("Open at Login") { LoginItem.shared.setEnabled(true) }
+                .buttonStyle(.borderedProminent).tint(Color.wpDesignYellow).foregroundStyle(.black)
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.wpDesignYellow.opacity(0.12), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .onAppear { LoginItem.shared.refresh() }
+    }
 
     private var migrationPrompt: some View {
         HStack(spacing: 10) {

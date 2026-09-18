@@ -9,12 +9,12 @@
 //               walk; a file deferred by the quiet window is picked up by the next pass without a new
 //               event. Journal paths are never trusted blindly: a folder replaced by a symlink, folders
 //               swapped under the same name (inside the source, the source itself, a folder above it), a
-//               change of letter case, and a pass interrupted halfway all end with current/ matching a
-//               full walk. Also the pure mapping from events to dirty directories.
+//               change of letter case or only of Unicode normalization, and a pass interrupted halfway
+//               all end with current/ matching a full walk. Also the pure mapping from events to dirty directories.
 //  @author      Kennt Kim
 //  @company     Calida Lab
 //  @created     2026-09-18
-//  @lastUpdated 2026-09-18
+//  @lastUpdated 2026-09-19
 //
 
 import CoreServices
@@ -259,6 +259,24 @@ final class JournalCaptureTests: XCTestCase {
         try fixture.assertConsistent()
         try fixture.pass(at: 24 * 60 + 20)                     // the daily full scan finds nothing to fix
         XCTAssertEqual(fixture.mirror("dir/sub/f.txt"), "v2--")
+        try fixture.assertConsistent()
+    }
+
+    func testANameThatOnlyChangesItsUnicodeNormalizationLeavesNoGhost() throws {
+        let nfd = "\u{D55C}\u{AE00}.txt".decomposedStringWithCanonicalMapping   // how Finder spells new Korean names
+        let nfc = "\u{D55C}\u{AE00}.txt".precomposedStringWithCanonicalMapping
+        try fixture.write(nfd, "v1")
+        try fixture.write("\u{BB38}\u{C11C}".decomposedStringWithCanonicalMapping + "/a.txt", "a1")
+        try fixture.pass(at: 0)
+        try fixture.rename(nfd, to: nfc)
+        try fixture.write(nfc, "v2-")
+        try fixture.write("\u{BB38}\u{C11C}".precomposedStringWithCanonicalMapping + "/a.txt", "a2-")   // through the other spelling
+        try fixture.pass(at: 16)
+
+        XCTAssertEqual(try fixture.store().allEntries().count, 4, "src, the file, the folder and its a.txt — one row each")
+        XCTAssertEqual(fixture.mirror(nfc), "v2-")
+        XCTAssertEqual(Set(try fixture.files(at: 1).values), ["v1", "a1"])
+        XCTAssertEqual(Set(try fixture.files(at: 2).values), ["v2-", "a2-"])
         try fixture.assertConsistent()
     }
 

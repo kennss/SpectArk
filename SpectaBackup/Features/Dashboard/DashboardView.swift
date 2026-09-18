@@ -7,7 +7,7 @@
 //  @author      Kennt Kim
 //  @company     Calida Lab
 //  @created     2026-06-29
-//  @lastUpdated 2026-09-18
+//  @lastUpdated 2026-09-19
 //
 
 import SwiftUI
@@ -15,6 +15,7 @@ import SwiftUI
 struct DashboardView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.dismissWindow) private var dismissWindow
     @State private var selectedJobID: UUID?
     @State private var fdaGranted = FullDiskAccess.isGranted
     @AppStorage("spectark.fdaCardDismissed") private var fdaDismissed = false
@@ -52,6 +53,14 @@ struct DashboardView: View {
                 JobDetailView(job: job)
             } else {
                 emptyState
+            }
+        }
+        .onAppear {
+            // Opened at login: back up quietly from the menu bar; the window SwiftUI shows goes away.
+            if AppLaunch.consumeQuietStart() {
+                dismissWindow(id: AppModel.dashboardWindowID)
+            } else {
+                AppLaunch.dashboardShown()
             }
         }
         .onChange(of: scenePhase) { _, phase in

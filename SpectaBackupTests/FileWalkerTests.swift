@@ -2,12 +2,12 @@
 //  @file        FileWalkerTests.swift
 //  @description Source walks and destination probing: a folder vanishing mid-walk is skipped in source
 //               walks only (walks over backup trees never tolerate it), the source root itself
-//               disappearing fails the walk instead of looking like deletions, and a local APFS
-//               destination is probed as clone-capable and written directly.
+//               disappearing fails the walk instead of looking like deletions, a local APFS destination is
+//               probed as clone-capable and written directly, and a network volume never is.
 //  @author      Kennt Kim
 //  @company     Calida Lab
 //  @created     2026-09-18
-//  @lastUpdated 2026-09-18
+//  @lastUpdated 2026-09-19
 //
 
 import XCTest
@@ -71,6 +71,18 @@ final class FileWalkerTests: XCTestCase {
         let caps = try DestinationProbe.probe(destination: dest)
         XCTAssertEqual(caps.fileSystem, .apfs)
         XCTAssertTrue(caps.supportsClone)
+        XCTAssertTrue(caps.isLocal)
+        XCTAssertEqual(caps.strategy, .direct)
+    }
+
+    func testANetworkVolumeIsNeverWrittenDirectly() {
+        // NFS keeps hard links, but a network file system must never hold the history catalog.
+        var caps = DestinationCapabilities(fileSystem: .other, isLocal: false, supportsClone: false,
+                                           supportsHardlink: true, hardlinkPersistsRemount: true,
+                                           xattrRoundTrip: true, isCaseSensitive: true,
+                                           mtimeResolution: .nanosecond, freeBytes: 0, probedAt: Date())
+        XCTAssertEqual(caps.strategy, .sparsebundle)
+        caps.isLocal = true
         XCTAssertEqual(caps.strategy, .direct)
     }
 }

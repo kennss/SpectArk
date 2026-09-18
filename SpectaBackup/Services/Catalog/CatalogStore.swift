@@ -6,7 +6,7 @@
 //  @author      Kennt Kim
 //  @company     Calida Lab
 //  @created     2026-06-29
-//  @lastUpdated 2026-06-29
+//  @lastUpdated 2026-09-19
 //
 //  Notes:
 //  - actor-isolated: the sqlite3 handle is single-threaded; all access is serialized through the actor.
@@ -120,6 +120,31 @@ actor CatalogStore {
         defer { sqlite3_finalize(stmt) }
         bindText(stmt, 1, SnapshotStatus.failed.rawValue)
         sqlite3_bind_int64(stmt, 2, seqId)
+        try step(stmt)
+    }
+
+    /// Re-register a complete snapshot tree that lost its row (1.1.x launch cleanup could drop the row of
+    /// a snapshot it was still publishing), or whose row never became complete (the publish renamed the
+    /// tree, then recording it failed). It keeps the seqId its directory name carries, so it takes its old
+    /// place in the timeline; a complete row with that id wins.
+    func adoptSnapshot(seqId: Int64, jobID: UUID, timestamp: Date, dirName: String, fileCount: Int,
+                       logicalBytes: Int64) throws {
+        let stmt = try prepare("""
+            INSERT INTO snapshots (seqId, jobID, timestamp, dirName, status, fileCount, logicalBytes,
+                                   addedBlocks, durationMs, sourceSnapshotID)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, NULL)
+            ON CONFLICT(seqId) DO UPDATE SET timestamp = excluded.timestamp, dirName = excluded.dirName,
+                status = excluded.status, fileCount = excluded.fileCount, logicalBytes = excluded.logicalBytes
+            WHERE snapshots.status != excluded.status;
+            """)
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_int64(stmt, 1, seqId)
+        bindText(stmt, 2, jobID.uuidString)
+        sqlite3_bind_double(stmt, 3, timestamp.timeIntervalSince1970)
+        bindText(stmt, 4, dirName)
+        bindText(stmt, 5, SnapshotStatus.complete.rawValue)
+        sqlite3_bind_int64(stmt, 6, Int64(fileCount))
+        sqlite3_bind_int64(stmt, 7, logicalBytes)
         try step(stmt)
     }
 

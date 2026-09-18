@@ -7,7 +7,7 @@
 //  @author      Kennt Kim
 //  @company     Calida Lab
 //  @created     2026-06-30
-//  @lastUpdated 2026-09-18
+//  @lastUpdated 2026-09-19
 //
 
 import SwiftUI
@@ -200,9 +200,31 @@ private struct BackupDefaultsPane: View {
 
 private struct GeneralPane: View {
     @AppStorage("spectabackup.appearance") private var appearance = "system"
+    private let loginItem = LoginItem.shared
 
     var body: some View {
         Form {
+            Section {
+                Toggle("Open at login", isOn: Binding(get: { loginItem.isEnabled || loginItem.needsApproval },
+                                                      set: { loginItem.setEnabled($0) }))
+                if loginItem.needsApproval {
+                    HStack {
+                        Text("Switched off in System Settings.")
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        Button("Open Login Items…") { loginItem.openSystemSettings() }
+                    }
+                }
+                if let error = loginItem.lastError {
+                    Text(error).font(.caption).foregroundStyle(Color.wpRed)
+                }
+            } header: {
+                Text("Startup")
+            } footer: {
+                Text("Realtime backup runs only while SpectArk is open. At login it starts quietly in the menu bar — no window, no Dock icon.")
+            }
+            .onAppear { loginItem.refresh() }
+
             Section {
                 Picker("Appearance", selection: $appearance) {
                     Text("System").tag("system")

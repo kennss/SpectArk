@@ -8,7 +8,7 @@
 //  @author      Kennt Kim
 //  @company     Calida Lab
 //  @created     2026-09-18
-//  @lastUpdated 2026-09-18
+//  @lastUpdated 2026-09-19
 //
 //  Notes:
 //  - Timing rules come from RerunPolicy. At most one automatic pass is armed at a time; a newer request
@@ -19,7 +19,10 @@
 //  - The coordinator only performs `.arm` for enabled realtime jobs; for others it calls
 //    `automaticRunsStopped()` so no stale pending state survives.
 //  - A started pass says whether it was requested (Back Up Now, a due schedule, a new job) rather than
-//    triggered by changes: a requested pass always ends with a checkpoint, an explicit restore point.
+//    triggered by changes: a requested pass always ends with a checkpoint, an explicit restore point. If
+//    it fails, the retry owes that checkpoint.
+//  - A migration (re-encrypting the job's backups) never overlaps a pass: requested while one runs, it
+//    starts when the pass ends, and work arriving meanwhile waits for the migration's end.
 //
 
 import Foundation
@@ -32,6 +35,8 @@ struct PassScheduler: Equatable {
         case arm(delay: TimeInterval, quietWindow: TimeInterval)
         /// Start a pass now. `requested`: someone asked for this backup (it seals a checkpoint).
         case start(quietWindow: TimeInterval, requested: Bool)
+        /// Start the requested migration now.
+        case startMigration
     }
 
     /// A pass or a migration is in progress.
@@ -47,6 +52,12 @@ struct PassScheduler: Equatable {
     /// Quiet window of the armed automatic pass; nil when none is armed.
     private(set) var armedQuietWindow: TimeInterval?
     private var consecutiveFailures = 0
+    /// A migration was requested while a pass ran.
+    private var migrationWhileBusy = false
+    /// The running pass was requested (or retries one that was).
+    private var runningRequested = false
+    /// A requested pass failed: the next pass must still seal a checkpoint.
+    private var owesCheckpoint = false
 
     // MARK: - Events
 
@@ -78,13 +89,22 @@ struct PassScheduler: Equatable {
             if window == 0 { settleWhileBusy = true }
             return .none
         }
-        return .start(quietWindow: window, requested: false)
+        return .start(quietWindow: window, requested: owesCheckpoint)
+    }
+
+    /// The user asked to migrate the job's backups (turning encryption on).
+    mutating func migrationRequested() -> Action {
+        if isBusy {
+            migrationWhileBusy = true
+            return .none
+        }
+        return .startMigration
     }
 
     /// What the job is busy with.
     enum Work: Equatable {
-        /// A backup pass reading the source with this quiet window.
-        case pass(quietWindow: TimeInterval)
+        /// A backup pass reading the source with this quiet window; `requested` as in `Action.start`.
+        case pass(quietWindow: TimeInterval, requested: Bool)
         /// Re-encrypting existing snapshots; it does not read the source.
         case migration
     }
@@ -97,8 +117,9 @@ struct PassScheduler: Equatable {
         isBusy = true
         armedQuietWindow = nil
         switch work {
-        case .pass(let quietWindow):
+        case let .pass(quietWindow, requested):
             pendingSince = nil
+            runningRequested = requested || owesCheckpoint
             if armedSettle && quietWindow > 0 { settleWhileBusy = true }
         case .migration:
             if hadPending { changedWhileBusy = true }
@@ -109,6 +130,15 @@ struct PassScheduler: Equatable {
     mutating func passFinished(now: Date, duration: TimeInterval, deferredCount: Int, succeeded: Bool) -> Action {
         isBusy = false
         notBefore = RerunPolicy.notBefore(passEndedAt: now, duration: duration)
+        owesCheckpoint = !succeeded && runningRequested
+        runningRequested = false
+        if migrationWhileBusy {
+            // The migration runs next (workStarted(.migration)); everything else pending waits for its
+            // end (migrationFinished). A failed pass is redone after it.
+            migrationWhileBusy = false
+            if !succeeded { changedWhileBusy = true }
+            return .startMigration
+        }
         let changed = changedWhileBusy, manual = manualWhileBusy, settle = settleWhileBusy
         changedWhileBusy = false
         manualWhileBusy = false
@@ -130,6 +160,7 @@ struct PassScheduler: Equatable {
 
     mutating func migrationFinished(now: Date) -> Action {
         isBusy = false
+        migrationWhileBusy = false   // a request made during the migration was served by it
         let changed = changedWhileBusy, manual = manualWhileBusy, settle = settleWhileBusy
         changedWhileBusy = false
         manualWhileBusy = false

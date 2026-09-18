@@ -17,14 +17,33 @@ All notable changes to SpectArk are documented here. The format follows
   every restore point of the last 24 hours is kept, then one per day for a month and one per week after
   that; a state you leave alone for a while always gets its own restore point, and Back Up Now always
   makes one.
+- **Open at login** (Settings ▸ General, or the prompt on a realtime backup): after a restart SpectArk
+  starts quietly in the menu bar — no window, no Dock icon — and realtime backup simply continues.
 - The latest backed-up state is a normal folder you can open in Finder (click the destination card).
+- **NAS backups show their timeline and restore in the app.** Their history lives inside the backup
+  image on the NAS, which SpectArk now keeps attached while anything uses it — a backup, the timeline,
+  the restore window — and detaches a few minutes after (and before the Mac sleeps, and when you quit).
+  Removing a NAS backup's data gives its space back on the NAS.
 - **Existing backups carry over.** On the first pass the new engine starts from your newest snapshot
   (cloned, so it takes no extra space on APFS) and copies only what changed since. Your earlier
   snapshots stay on the same timeline — browsable and restorable — until the retention policy ages
   them out; a "keep N" policy counts old snapshots and new restore points together.
 - Turning on encryption also converts the new engine's restore points, not just earlier snapshots.
+- Automatic retention counts days in your local time, from 5 AM to 5 AM, so a late night of work is one
+  day's restore point rather than two; it used to split days at midnight UTC.
 
 ### Fixed
+- **A file locked in Finder no longer stops a backup**, and restoring it puts the lock back. Restoring
+  over a locked file works, and a restore that fails leaves the existing file exactly as it was.
+- **Turning on encryption after an interrupted attempt removes all of the plaintext.** Restore points the
+  first attempt had already encrypted were skipped the second time — and so were left behind unencrypted,
+  without being counted. Turning on encryption for a NAS backup now converts the backups inside its image
+  too; they used to be left there as they were.
+- **NAS backups no longer stop for good after a crash.** The NAS image's writer lock recorded only a
+  process number; after a crash and a reboot, when a system process happened to get the same number,
+  every later backup to that NAS failed as "locked by another writer". The lock now records the
+  writer's start time and the Mac's hardware ID, and an old-format lock counts only while its process
+  is SpectArk.
 - **Realtime backup no longer runs non-stop on developer folders.** Every filesystem event started a
   full pass — including Git's `.git/index.lock`, which editors and tools create and remove every few
   seconds while polling `git status`. The watcher now ignores changes the backup would skip anyway

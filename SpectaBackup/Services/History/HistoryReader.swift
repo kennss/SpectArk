@@ -7,13 +7,14 @@
 //  @author      Kennt Kim
 //  @company     Calida Lab
 //  @created     2026-09-18
-//  @lastUpdated 2026-09-18
+//  @lastUpdated 2026-09-19
 //
 //  Notes:
 //  - Nothing is materialised to browse: a checkpoint is rebuilt from `entries(born ≤ c)` and
 //    `versions(born ≤ c < died)`.
 //  - Restore writes each file through RestoreEngine.restoreFile (temp + atomic rename, conflict policy),
-//    so an existing file is never destroyed by a failed restore. No exclusions apply to a restore.
+//    so an existing file is never destroyed by a failed restore, and puts the recorded lock flags back.
+//    No exclusions apply to a restore. Names come back in Unicode NFC (the catalog's form).
 //  - Paths given to `restore` are relative to the source folder, like the legacy restore; directories
 //    are expanded as they were at the checkpoint (parents before children).
 //  - Must not run concurrently with a capture pass on the same job (the BackupRunner actor serialises
@@ -64,7 +65,7 @@ struct HistoryReader: Sendable {
                 }
             } else {
                 engine.restoreFile(src: URL(fileURLWithPath: contentPath(of: item)), dst: dst,
-                                   conflict: conflict, outcome: &outcome)
+                                   conflict: conflict, outcome: &outcome, lockFlags: item.lockFlags)
             }
             processed += 1
             progress(processed)

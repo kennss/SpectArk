@@ -6,15 +6,16 @@
 //  @author      Kennt Kim
 //  @company     Calida Lab
 //  @created     2026-06-29
-//  @lastUpdated 2026-09-18
+//  @lastUpdated 2026-09-19
 //
 //  Notes:
 //  - @Observable + @MainActor (Swift 6). UI reads `jobs` and `state(for:)`; heavy work is on `runner`.
 //  - When a job runs is decided by its PassScheduler (pure, unit-tested): this class only feeds it
 //    events and performs the action it returns — start a pass now, or arm the job's single timer.
 //    Nothing that arrives while a job is busy is dropped; manual runs are never throttled.
-//  - A job never runs two passes at once (the scheduler's busy state); the runner actor additionally
-//    serializes execution to avoid concurrent destination writes.
+//  - A job never runs two passes at once (the scheduler's busy state). Each destination has its own
+//    runner actor: jobs on one destination (one disk, one NAS image) take turns, jobs on different
+//    destinations run side by side — a slow NAS never holds up the protection of local jobs.
 //  - Watchers only fire for changes the job's exclusions would not skip (ChangeFilter).
 //  - Realtime jobs get one catch-up pass at launch (changes made while SpectArk was not running), and
 //    one when they start running on changes (enabled, switched to realtime) or when what they back
@@ -33,7 +34,8 @@ final class BackupCoordinator {
     private let store = JobStore()
     /// False in a unit-test host: the saved job list is neither loaded nor overwritten (AppRuntime).
     private let usesSavedJobs: Bool
-    private let runner = BackupRunner()
+    /// One runner per destination (standardized path), created on first use.
+    private var runners: [String: BackupRunner] = [:]
     private var watchers: [UUID: FolderWatcher] = [:]
     /// Per-job scheduling state; the source of truth for "busy" and for what runs next.
     private var schedulers: [UUID: PassScheduler] = [:]
@@ -80,7 +82,7 @@ final class BackupCoordinator {
         persist()
         if deleteSnapshots, let job {
             KeychainStorage.removePassword(for: id)   // drop the encrypted repo's key too, if any
-            Task { await runner.deleteJobData(for: job) }
+            Task { await runner(for: job).deleteJobData(for: job) }
         }
     }
 
@@ -137,6 +139,15 @@ final class BackupCoordinator {
 
     // MARK: - Running
 
+    /// The runner that owns `job`'s destination.
+    private func runner(for job: BackupJob) -> BackupRunner {
+        let key = job.destination.standardizedFileURL.path
+        if let runner = runners[key] { return runner }
+        let runner = BackupRunner()
+        runners[key] = runner
+        return runner
+    }
+
     /// Back up now (the user, a new job, or a due schedule). Starts immediately, or right after the
     /// job's current work if it is busy — never throttled.
     func runNow(_ jobID: UUID) {
@@ -147,7 +158,7 @@ final class BackupCoordinator {
     private func startPass(_ jobID: UUID, quietWindow: TimeInterval, requested: Bool) {
         guard let job = jobs.first(where: { $0.id == jobID }) else { return }
         cancelArmedPass(jobID)   // this pass covers whatever the armed one was for
-        schedulers[jobID, default: PassScheduler()].workStarted(.pass(quietWindow: quietWindow))
+        schedulers[jobID, default: PassScheduler()].workStarted(.pass(quietWindow: quietWindow, requested: requested))
         var st = state(for: jobID)
         st.isRunning = true
         st.lastError = nil
@@ -168,9 +179,9 @@ final class BackupCoordinator {
         let deferredCount: Int
         let succeeded: Bool
         do {
-            let result = try await runner.run(job: job, quietWindow: quietWindow, forceCheckpoint: requested,
+            let result = try await runner(for: job).run(job: job, quietWindow: quietWindow, forceCheckpoint: requested,
                                               progress: progress)
-            let history = try? await runner.history(for: job)
+            let history = try? await runner(for: job).history(for: job)
             guard jobs.contains(where: { $0.id == jobID }) else { return forgetRemovedJob(jobID) }
             var st = state(for: jobID)
             st.isRunning = false
@@ -233,7 +244,7 @@ final class BackupCoordinator {
             Task {
                 // Drop orphaned 0-file inProgress rows left by a previous run — never a row of a pass
                 // this run has already started (the launch catch-up pass may beat this cleanup).
-                await runner.cleanupIncompleteSnapshots(for: j, startedBefore: launchedAt)
+                await runner(for: j).cleanupIncompleteSnapshots(for: j, startedBefore: launchedAt)
                 loadHistory(for: j)
             }
         }
@@ -274,7 +285,7 @@ final class BackupCoordinator {
     private func loadHistory(for job: BackupJob) {
         let jobID = job.id
         Task {
-            guard let history = try? await runner.history(for: job) else { return }
+            guard let history = try? await runner(for: job).history(for: job) else { return }
             var st = state(for: jobID)
             st.apply(history)
             states[jobID] = st
@@ -283,10 +294,21 @@ final class BackupCoordinator {
 
     // MARK: - Restore
 
-    /// Lists a restore point item by item, for the restore UI (nil for encrypted snapshots).
-    func browser(jobID: UUID, point: RestorePoint, sourceName: String) -> (any RestoreBrowser)? {
-        guard let job = jobs.first(where: { $0.id == jobID }) else { return nil }
-        return runner.browser(job: job, point: point, sourceName: sourceName)
+    /// Open a job's backups for the restore sheet; a NAS job's image is attached off the main actor and
+    /// stays attached until `endBrowsing`.
+    func beginBrowsing(_ jobID: UUID) async throws -> BackupRunner.BrowseSession {
+        guard let job = jobs.first(where: { $0.id == jobID }) else { throw CocoaError(.fileNoSuchFile) }
+        return try await Task.detached(priority: .userInitiated) { try BackupRunner.beginBrowsing(job: job) }.value
+    }
+
+    /// Close a browsing session. Off the main actor: the image's lease may be busy attaching or compacting.
+    func endBrowsing(_ session: BackupRunner.BrowseSession) {
+        Task.detached(priority: .utility) { BackupRunner.endBrowsing(session) }
+    }
+
+    /// Lists a restore point of an open session item by item (nil for encrypted snapshots).
+    func browser(session: BackupRunner.BrowseSession, point: RestorePoint, sourceName: String) -> (any RestoreBrowser)? {
+        BackupRunner.browser(session: session, point: point, sourceName: sourceName)
     }
 
     /// Restore selected items of a restore point into a target directory (runs off the main actor).
@@ -294,14 +316,14 @@ final class BackupCoordinator {
                  relPaths: [String], to target: URL, conflict: RestoreEngine.ConflictPolicy,
                  progress: @escaping @Sendable (Int) -> Void) async throws -> RestoreEngine.Outcome {
         guard let job = jobs.first(where: { $0.id == jobID }) else { return RestoreEngine.Outcome() }
-        return try await runner.restore(job: job, point: point, sourceName: sourceName,
+        return try await runner(for: job).restore(job: job, point: point, sourceName: sourceName,
                                         relPaths: relPaths, to: target, conflict: conflict, progress: progress)
     }
 
     /// Restore an entire encrypted snapshot into a target folder.
     func restoreEncrypted(jobID: UUID, snapshotDirName: String, to target: URL) async throws {
         guard let job = jobs.first(where: { $0.id == jobID }) else { return }
-        try await runner.restoreEncrypted(job: job, snapshotID: snapshotDirName, to: target)
+        try await runner(for: job).restoreEncrypted(job: job, snapshotID: snapshotDirName, to: target)
     }
 
     // MARK: - Encryption migration
@@ -309,7 +331,7 @@ final class BackupCoordinator {
     /// How many plaintext restore points a job still has (used to decide whether to migrate).
     func plaintextSnapshotCount(_ jobID: UUID) async -> Int {
         guard let job = jobs.first(where: { $0.id == jobID }) else { return 0 }
-        return await runner.plaintextSnapshotCount(for: job)
+        return await runner(for: job).plaintextSnapshotCount(for: job)
     }
 
     /// Dismiss the post-migration success note.
@@ -320,11 +342,21 @@ final class BackupCoordinator {
     }
 
     /// Migrate a job's plaintext restore points into its encrypted repo (off-main), surfacing progress and
-    /// keeping the plaintext intact if anything fails.
+    /// keeping the plaintext intact if anything fails. Waits for a running pass to end first.
     func migrateToEncrypted(_ jobID: UUID) {
+        guard jobs.contains(where: { $0.id == jobID }) else { return }
+        perform(schedulers[jobID, default: PassScheduler()].migrationRequested(), for: jobID)
+    }
+
+    private func startMigration(_ jobID: UUID) {
         guard let job = jobs.first(where: { $0.id == jobID }) else { return }
         cancelArmedPass(jobID)   // pending work carries over to the migration's end (PassScheduler)
         schedulers[jobID, default: PassScheduler()].workStarted(.migration)
+        // Queued behind a pass, the request may have outlived the setting (encryption turned off again).
+        guard job.encryptionEnabled else {
+            perform(schedulers[jobID, default: PassScheduler()].migrationFinished(now: Date()), for: jobID)
+            return
+        }
         var st = state(for: jobID)
         st.isMigrating = true
         st.migrationProgress = MigrationProgress(done: 0, total: 0)
@@ -341,7 +373,7 @@ final class BackupCoordinator {
         Task {
             var succeeded = false
             do {
-                try await runner.migrateToEncrypted(job: job, progress: progress)
+                try await runner(for: job).migrateToEncrypted(job: job, progress: progress)
                 loadHistory(for: job)
                 succeeded = true
             } catch {
@@ -431,6 +463,8 @@ final class BackupCoordinator {
             break
         case let .start(quietWindow, requested):
             startPass(jobID, quietWindow: quietWindow, requested: requested)
+        case .startMigration:
+            startMigration(jobID)
         case .arm(let delay, _):   // the scheduler remembers the armed quiet window itself
             arm(jobID, delay: delay)
         }

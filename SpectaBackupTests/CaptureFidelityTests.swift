@@ -3,12 +3,14 @@
 //  @description What the history engine's mirror preserves and refuses: permissions, xattrs and the
 //               modification time of files, symlinks copied as links (never followed); Git lock files
 //               never backed up; a future-dated file (camera clock, extracted archive) copied rather than
-//               deferred forever; and an entry SpectArk cannot read failing the pass — keeping the
-//               previous backup and sealing nothing — instead of silently dropping out of the backup.
+//               deferred forever; an entry SpectArk cannot read failing the pass — keeping the
+//               previous backup and sealing nothing — instead of silently dropping out of the backup; and a
+//               file locked in Finder backed up, replaced and removed like any other, its lock recorded and
+//               put back on restore.
 //  @author      Kennt Kim
 //  @company     Calida Lab
 //  @created     2026-09-18
-//  @lastUpdated 2026-09-18
+//  @lastUpdated 2026-09-19
 //
 
 import Darwin
@@ -50,6 +52,37 @@ final class CaptureFidelityTests: XCTestCase {
         XCTAssertEqual(copy.st_mode & S_IFMT, S_IFLNK)
         XCTAssertEqual(try FileManager.default.destinationOfSymbolicLink(atPath: link), "data.bin")
         XCTAssertEqual(try fixture.store().entry(at: "src/link")?.kind, .symlink)
+        try fixture.assertConsistent()
+    }
+
+    func testALockedFileIsBackedUpReplacedRemovedAndRestoredWithItsLock() throws {
+        let immutable = UInt32(UF_IMMUTABLE)
+        let doc = fixture.source.appendingPathComponent("doc.txt").path
+        try fixture.write("doc.txt", "v1")
+        XCTAssertEqual(lchflags(doc, immutable), 0)
+        try fixture.pass(at: 0)
+        XCTAssertEqual(try Syscalls.flags(of: fixture.layout.current("src/doc.txt")) & Syscalls.lockFlags, 0,
+                       "a locked copy could never be replaced or retired")
+        XCTAssertEqual(try fixture.store().entry(at: "src/doc.txt")?.lockFlags, immutable)
+
+        XCTAssertEqual(lchflags(doc, 0), 0)
+        try fixture.write("doc.txt", "v2-")
+        XCTAssertEqual(lchflags(doc, immutable), 0)
+        try fixture.pass(at: 16)                                  // v1 retires into versions/
+        XCTAssertEqual(fixture.mirror("doc.txt"), "v2-")
+
+        let target = fixture.root.appendingPathComponent("restored", isDirectory: true)
+        let outcome = try HistoryReader(layout: fixture.layout)
+            .restore(sourceName: "src", relPaths: ["doc.txt"], at: 1, to: target, conflict: .overwrite)
+        XCTAssertEqual(outcome.restored, 1)
+        let restored = target.appendingPathComponent("doc.txt").path
+        XCTAssertEqual(try String(contentsOfFile: restored, encoding: .utf8), "v1")
+        XCTAssertEqual(try Syscalls.flags(of: restored) & Syscalls.lockFlags, immutable, "the lock comes back")
+
+        XCTAssertEqual(lchflags(doc, 0), 0)
+        try fixture.delete("doc.txt")
+        try fixture.pass(at: 32)
+        XCTAssertNil(fixture.mirror("doc.txt"))
         try fixture.assertConsistent()
     }
 

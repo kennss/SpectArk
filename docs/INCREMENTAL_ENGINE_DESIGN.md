@@ -51,6 +51,20 @@ coherence) and lose metadata SMB does not carry (xattrs, BSD flags, permissions)
 Machine uses sparsebundles on NAS too. The cost: `current/` of a NAS job is browsable in Finder only
 while the image is mounted.
 
+Everything that reads or writes a NAS job's backups — a pass, the timeline, a restore, the open restore
+sheet, a migration — holds the image through the destination's `ImageLease`: attached on first use,
+shared while in use, flushed (`F_FULLFSYNC`) after every write, and detached 30 s after the last user
+left (short, so another Mac backing up to the same image is not locked out for long; before sleep if
+idle, always at quit). Every detach first checks the volume at the mount point is ours (its UUID): macOS
+ejects an image whose share dropped, and another volume named alike can take the path. A job is an image
+job when it has no direct layout and the image exists — read from disk (a share that cannot tell throws,
+never reads as "absent"), so passes and reads agree. An encrypted job's repo and catalog stay on the share
+itself; migrating a NAS job moves its plaintext out of the image, and its folder there goes only when
+nothing is left the migration did not account for. Deleting inside an image frees nothing on the share
+(measured): removing a job's backups asks the lease to reclaim, which runs once nobody uses the image and
+decides then, under the writer lock, whether any job's backups remain — none: the image is renamed away
+and deleted; some, or unreadable: it is compacted.
+
 ### 3.2 Generations and checkpoints
 
 - The catalog keeps a **pending generation** `g` (starts at 1). A **checkpoint** seals generation `g`
@@ -109,7 +123,10 @@ batch, not per file.
 ### 3.6 Retention
 
 - Checkpoints: Time Machine thinning — all within 24 h (≤ 96 at 15-minute spacing), the newest per day
-  for 30 days, the newest per week after that; the existing space rules (minimum free space, quota)
+  for 30 days, the newest per week after that. Days and weeks are local and begin at 05:00 on the wall
+  clock (decided 2026-09-19; daylight saving does not move it): a night of work belongs to the day it
+  began, instead of splitting at midnight — or, as 1.1.x did, at UTC midnight, which fell mid-morning in
+  Asia. Moving to another time zone re-buckets older restore points by the new local days; the existing space rules (minimum free space, quota)
   drop the oldest first. The newest checkpoint and `current/` are never pruned.
 - A version is deleted when no kept checkpoint lies in its `[born, died)`.
 
@@ -193,6 +210,17 @@ checkpoint cadence later; their storage format is unchanged.
 - Hard links inside a source are stored as independent files (content preserved, link not).
 - A file written continuously is captured at most once per settle pass (quiet window); a consistent
   read of such files needs source snapshots (TODO P2).
+- Catalog paths are stored in Unicode NFC (schema version 2), because SQLite compares bytes while APFS,
+  HFS+ and Swift compare canonically equivalent names as equal. A restored name therefore comes back in
+  NFC even if the source spelled it NFD (as Finder does for Korean names): it looks the same and the
+  file system treats it as the same name, but its bytes may differ.
+- The catalog is the history: without `history.sqlite` nothing in `versions/` can be placed in time.
+  A job whose catalog is missing starts over — its pristine catalog clears `current/` and `versions/`,
+  seeds from the newest legacy snapshot if there is one, and seals a new checkpoint 1.
+- On an HFS+ destination a seed saves no copying: HFS+ keeps mtimes in whole seconds, so no seeded file
+  matches its source and the first pass copies everything again (the result is still correct).
+- The first-pass seed is walked per item with an fsync each; over SMB (inside the NAS image) that took
+  about 15 minutes for 96 k entries — once per job.
 
 ## 6. Migration from 1.1.x
 
@@ -215,9 +243,18 @@ Per job, on the first pass of the new engine (`HistorySeeder`, then a normal pas
    together ("keep 10" keeps the ten newest restore points of either kind), space pressure drops the
    oldest first — the legacy ones — and the newest restore point is always kept. `.inprogress-*`
    partials of the old engine are discarded.
-5. Turning encryption on re-encrypts every plaintext restore point into the repo — legacy snapshots, then
+5. A dropped legacy snapshot is renamed to `.deleting-<name>`, then its row is deleted, then the tree —
+   in the background on local destinations (TreeReaper, background QoS; retention counts what it is
+   about to free as free space), within the pass inside a NAS image. A `.deleting-` tree is always
+   garbage; a complete tree (COMPLETE marker) that lost its row to a 1.1.x bug is put back on the
+   timeline, never deleted on guesswork. Only lock flags are ever lifted, and never through another
+   hard link of the inode (HFS+ trees share inodes; clearing e.g. UF_COMPRESSED would empty a file).
+6. Turning encryption on re-encrypts every plaintext restore point into the repo — legacy snapshots, then
    each checkpoint and the unsealed latest state, rebuilt as a cloned folder tree
-   (`HistoryMaterializer`) — and deletes the plaintext only after all of them succeeded.
+   (`HistoryMaterializer`) — and deletes the plaintext only after all of them succeeded. A history
+   catalog it cannot read stops it: that history is never discarded unencrypted. Each encrypted point
+   records which plaintext point it came from, so a migration run again after an interruption skips it.
+   Operations on one destination (passes, migrations, restores, cleanup) take turns from start to end.
 
 ## 7. Phases
 
@@ -226,15 +263,19 @@ Per job, on the first pass of the new engine (`HistorySeeder`, then a normal pas
 2. **Retention and pruning; restore/browse API** over checkpoints. *(done)*
 3. **FSEvents journal cursor and dirty-directory scans.** *(done)*
 4. **Migration, UI (timeline, browse checkpoints and legacy snapshots), switch jobs to the new
-   engine.** *(done)* NAS jobs run the engine inside their sparsebundle; listing and restoring their
-   history in the app needs the image attached for browsing (TODO).
+   engine.** *(done)* NAS jobs run the engine inside their sparsebundle, and the timeline, browsing and
+   restore read it there (§3.1).
 5. **Remove the per-snapshot writing path** (SnapshotEngine and its retention planner); legacy trees
    remain readable until they age out. *(done)*
 
 ## 8. To verify during implementation
 
 - Throughput of the batched intent scheme on the external SSD and over SMB (target: an initial seed of
-  Developments in minutes, a one-file pass in well under a second after the walk).
+  Developments in minutes, a one-file pass in well under a second after the walk). Measured on the
+  first install (2026-09-18, 1.2.0): Developments seeded (107 k entries, from a 722 k-entry 1.1.x tree)
+  and its first full pass done in under a minute on the external USB SSD; later journal passes about a
+  second; ~Working 75 k entries seeded in 21 s on the internal SSD; the NAS job (96 k entries) seeded
+  inside its sparsebundle over SMB in about 15 minutes.
 - FSEvents replay limits (how long the journal keeps history; behaviour on removable source volumes).
 - Replay time after a long absence (days of volume-wide events since the cursor) against the 30 s
   timeout; only short spans have been measured so far.

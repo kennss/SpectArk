@@ -7,7 +7,7 @@
 //  @author      Kennt Kim
 //  @company     Calida Lab
 //  @created     2026-06-29
-//  @lastUpdated 2026-09-18
+//  @lastUpdated 2026-09-19
 //
 //  Notes:
 //  - NEVER writes the original in place: copy → temp → rename(over). overwrite clears uchg first.
@@ -83,8 +83,12 @@ struct RestoreEngine: Sendable {
     // MARK: - Per-file restore (temp + atomic rename)
 
     /// Restore one file or symlink from `src` to `dst` under the conflict policy. Shared with the history
-    /// engine's restore, whose sources live in current/ or versions/.
-    func restoreFile(src: URL, dst: URL, conflict: ConflictPolicy, outcome: inout Outcome) {
+    /// engine's restore, whose sources live in current/ or versions/. The restored item gets `lockFlags`
+    /// (UF_IMMUTABLE/UF_APPEND — the history engine passes them from its catalog) or, when nil, those
+    /// of `src` itself (legacy snapshot trees keep them). They are set only after the final rename: a
+    /// locked temp could not be renamed.
+    func restoreFile(src: URL, dst: URL, conflict: ConflictPolicy, outcome: inout Outcome,
+                     lockFlags: UInt32? = nil) {
         let fm = FileManager.default
         ensureDirectory(dst.deletingLastPathComponent())
 
@@ -95,7 +99,7 @@ struct RestoreEngine: Sendable {
                 outcome.skipped += 1
                 return
             case .overwrite:
-                try? Syscalls.clearUserFlags(dst.path)   // immutable files would block the rename
+                break   // replaced only once the new copy is complete (Syscalls.replace), never before
             case .keepBoth:
                 finalDst = uniqueName(for: dst)
             }
@@ -104,11 +108,14 @@ struct RestoreEngine: Sendable {
         let tmp = dst.deletingLastPathComponent()
             .appendingPathComponent(".sbk-restore-\(UUID().uuidString)")
         do {
+            let flags = try lockFlags ?? (Syscalls.flags(of: src.path) & Syscalls.lockFlags)
             try Syscalls.copyItem(at: src.path, to: tmp.path)
-            try Syscalls.atomicRename(tmp.path, to: finalDst.path)   // atomic; replaces dst if present
+            try Syscalls.unlock(tmp.path)
+            try Syscalls.replace(tmp.path, over: finalDst.path)   // atomic, even over a locked file
+            try? Syscalls.lock(finalDst.path, flags: flags)
             outcome.restored += 1
         } catch {
-            try? fm.removeItem(at: tmp)
+            try? TreeRemoval.remove(tmp.path)
             outcome.failed.append(dst.lastPathComponent)
         }
     }

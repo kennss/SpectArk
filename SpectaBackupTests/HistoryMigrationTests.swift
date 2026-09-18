@@ -6,12 +6,16 @@
 //               of an interrupted seed never linger, and an unchanged source adds no checkpoint. End to end
 //               through the BackupRunner: a job with 1.1.x snapshots gets checkpoint 1 on its next pass,
 //               keeps its old snapshots on the same timeline (restorable), and stops writing snapshot
-//               trees. HistoryMaterializer: a checkpoint rebuilt as a folder tree is exactly that checkpoint,
-//               and survives a round trip through the encrypted repo (the encryption migration's path).
+//               trees. A locked legacy file is seeded unlocked and the snapshot keeps its lock.
+//               HistoryMaterializer: a checkpoint rebuilt as a folder tree is exactly that checkpoint, and
+//               survives a round trip through the encrypted repo. Turning encryption on leaves no plaintext
+//               (even a seeded mirror that is no restore point, or a point an interrupted run encrypted)
+//               and keeps sources since removed; a snapshot it cannot read stops it, and a history started
+//               again after encryption was turned off is encrypted, never taken for the old one.
 //  @author      Kennt Kim
 //  @company     Calida Lab
 //  @created     2026-09-18
-//  @lastUpdated 2026-09-18
+//  @lastUpdated 2026-09-19
 //
 
 import Darwin
@@ -117,6 +121,25 @@ final class HistoryMigrationTests: XCTestCase {
         try fixture.assertConsistent()
     }
 
+    func testALockedLegacyFileIsSeededUnlockedAndTheSnapshotKeepsItsLock() throws {
+        let immutable = UInt32(UF_IMMUTABLE)
+        try fixture.write("doc.txt", "locked in 1.1.x")
+        try takeLegacySnapshot()
+        let legacyDoc = snapshotRoot.appendingPathComponent("src/doc.txt").path
+        XCTAssertEqual(lchflags(legacyDoc, immutable), 0)
+
+        try HistorySeeder(layout: fixture.layout).seedIfPristine(from: snapshotRoot, sourceNames: ["src"],
+                                                                 exclusions: BackupExclusions(job: fixture.job))
+        XCTAssertEqual(try Syscalls.flags(of: fixture.layout.current("src/doc.txt")) & Syscalls.lockFlags, 0)
+        XCTAssertEqual(try fixture.store().entry(at: "src/doc.txt")?.lockFlags, immutable)
+        XCTAssertEqual(try Syscalls.flags(of: legacyDoc) & Syscalls.lockFlags, immutable, "the snapshot is untouched")
+
+        try fixture.write("doc.txt", "changed")
+        try fixture.pass(at: 0)                                   // replacing the seeded copy works
+        XCTAssertEqual(fixture.mirror("doc.txt"), "changed")
+        try fixture.assertConsistent()
+    }
+
     // MARK: - HistoryMaterializer
 
     func testACheckpointMaterializesExactlyAndRoundTripsThroughTheEncryptedRepo() async throws {
@@ -130,7 +153,7 @@ final class HistoryMigrationTests: XCTestCase {
 
         for seq in [Int64(1), 2] {
             let tree = fixture.layout.jobRoot.appendingPathComponent(".materialize-\(seq)", isDirectory: true)
-            let roots = try HistoryMaterializer(layout: fixture.layout).materialize(sourceNames: ["src"], at: seq, into: tree)
+            let roots = try HistoryMaterializer(layout: fixture.layout).materialize(at: seq, into: tree)
             XCTAssertEqual(roots.map(\.lastPathComponent), ["src"])
             var built: [String: String] = [:]
             try FileWalker.walk(root: tree, exclusions: .includeEverything) { item in
@@ -155,6 +178,168 @@ final class HistoryMigrationTests: XCTestCase {
             try FileManager.default.removeItem(at: tree)
         }
         try fixture.assertConsistent()
+    }
+
+    func testLegacyTreesLeftBehindAreReconciledNeverDeletedOnGuesswork() async throws {
+        let job = fixture.job
+        try fixture.write("a.txt", "alpha")
+        let kept = try await publishLegacySnapshot(of: job)
+        let snapshots = BackupRunner.jobRoot(for: job).appendingPathComponent("snapshots", isDirectory: true)
+        let fm = FileManager.default
+        // A complete tree whose row a 1.1.x launch cleanup dropped: a restore point to put back.
+        let lost = snapshots.appendingPathComponent("20260101-000000-99", isDirectory: true)
+        try fm.createDirectory(at: lost.appendingPathComponent("src"), withIntermediateDirectories: true)
+        try Data("lost".utf8).write(to: lost.appendingPathComponent("src/x.txt"))
+        try Data().write(to: lost.appendingPathComponent(SnapshotBrowser.completeMarker))
+        // A tree without its marker: nothing to judge, left alone.
+        let unknown = snapshots.appendingPathComponent("20260102-000000-98", isDirectory: true)
+        try fm.createDirectory(at: unknown.appendingPathComponent("src"), withIntermediateDirectories: true)
+        // A deletion interrupted after its rename: finished, row included.
+        let catalog = try CatalogStore(path: BackupRunner.jobRoot(for: job).appendingPathComponent("catalog.sqlite").path)
+        try await catalog.adoptSnapshot(seqId: 97, jobID: job.id, timestamp: Date(timeIntervalSince1970: 0),
+                                        dirName: "19700101-000000-97", fileCount: 0, logicalBytes: 0)
+        let doomed = snapshots.appendingPathComponent(".deleting-19700101-000000-97", isDirectory: true)
+        try fm.createDirectory(at: doomed, withIntermediateDirectories: true)
+
+        _ = try await BackupRunner().run(job: job) { _ in }
+        TreeReaper.shared.drain()   // dropped trees go in the background
+        let rows = try await catalog.snapshots(jobID: job.id).map(\.dirName)
+        XCTAssertTrue(rows.contains("20260101-000000-99"), "put back on the timeline")
+        XCTAssertTrue(fm.fileExists(atPath: lost.path))
+        XCTAssertTrue(fm.fileExists(atPath: unknown.path), "never deleted on guesswork")
+        XCTAssertFalse(rows.contains("19700101-000000-97"))
+        XCTAssertFalse(fm.fileExists(atPath: doomed.path))
+        XCTAssertTrue(fm.fileExists(atPath: snapshots.appendingPathComponent(kept.dirName).path))
+    }
+
+    // MARK: - Turning encryption on
+
+    private func makeRepo(for job: BackupJob, password: String) async throws {
+        let repo = BackupRunner.jobRoot(for: job).appendingPathComponent("repo", isDirectory: true)
+        _ = try await RepoManager.create(backend: try LocalBackend(root: repo), password: Data(password.utf8))
+    }
+
+    func testTurningEncryptionOnLeavesNoPlaintextBehind() async throws {
+        let job = fixture.job
+        try fixture.write("a.txt", "alpha")
+        let legacySnapshot = try await publishLegacySnapshot(of: job)
+        let runner = BackupRunner()
+        _ = try await runner.run(job: job) { _ in }   // seeds from the snapshot; nothing changed since
+        XCTAssertNotNil(fixture.mirror("a.txt"))
+        XCTAssertTrue(try fixture.store().checkpoints().isEmpty, "the seeded mirror is no restore point of its own")
+
+        try await makeRepo(for: job, password: "pw")
+        try await runner.migrateToEncrypted(job: job, password: "pw") { _, _ in }
+
+        let fm = FileManager.default
+        for leftover in [fixture.layout.currentRoot, fixture.layout.versionsRoot, fixture.layout.catalogPath,
+                         BackupRunner.jobRoot(for: job).appendingPathComponent("snapshots/\(legacySnapshot.dirName)").path] {
+            XCTAssertFalse(fm.fileExists(atPath: leftover), "plaintext left: \(leftover)")
+        }
+        let points = try await runner.history(for: job).points
+        XCTAssertEqual(points.map(\.isBrowsable), [false], "one encrypted point")
+        let remaining = await runner.plaintextSnapshotCount(for: job)
+        XCTAssertEqual(remaining, 0)
+    }
+
+    func testARetriedMigrationAlsoRemovesWhatAnEarlierRunEncrypted() async throws {
+        let job = fixture.job
+        try fixture.write("a.txt", "alpha")
+        let first = try await publishLegacySnapshot(of: job)
+        try fixture.write("a.txt", "beta!")
+        let second = try await publishLegacySnapshot(of: job)
+        try await makeRepo(for: job, password: "pw")
+        let snapshots = BackupRunner.jobRoot(for: job).appendingPathComponent("snapshots", isDirectory: true)
+        // The second snapshot cannot be read: the first run encrypts the first one, then stops.
+        let unreadable = snapshots.appendingPathComponent("\(second.dirName)/src").path
+        chmod(unreadable, 0)
+        defer { chmod(unreadable, 0o755) }
+        let runner = BackupRunner()
+        do {
+            try await runner.migrateToEncrypted(job: job, password: "pw") { _, _ in }
+            XCTFail("an unreadable snapshot must stop the migration")
+        } catch {}
+        let fm = FileManager.default
+        XCTAssertTrue(fm.fileExists(atPath: snapshots.appendingPathComponent(first.dirName).path), "plaintext intact")
+        let stillPlaintext = await runner.plaintextSnapshotCount(for: job)
+        XCTAssertEqual(stillPlaintext, 2, "the encrypted one is still plaintext on disk")
+
+        chmod(unreadable, 0o755)
+        try await runner.migrateToEncrypted(job: job, password: "pw") { _, _ in }
+        TreeReaper.shared.drain()
+        for snapshot in [first, second] {
+            XCTAssertFalse(fm.fileExists(atPath: snapshots.appendingPathComponent(snapshot.dirName).path),
+                           "plaintext left: \(snapshot.dirName)")
+        }
+        let points = try await runner.history(for: job).points
+        XCTAssertEqual(points.map(\.isBrowsable), [false, false], "each encrypted once")
+        let remaining = await runner.plaintextSnapshotCount(for: job)
+        XCTAssertEqual(remaining, 0)
+    }
+
+    func testASnapshotThatCannotBeReadStopsTheMigration() async throws {
+        let job = fixture.job
+        try fixture.write("a.txt", "alpha")
+        let snapshot = try await publishLegacySnapshot(of: job)
+        try await makeRepo(for: job, password: "pw")
+        let tree = BackupRunner.jobRoot(for: job).appendingPathComponent("snapshots/\(snapshot.dirName)").path
+        chmod(tree, 0)
+        defer { chmod(tree, 0o755) }
+        do {
+            try await BackupRunner().migrateToEncrypted(job: job, password: "pw") { _, _ in }
+            XCTFail("a snapshot whose folders are unknown is no empty snapshot")
+        } catch {}
+        chmod(tree, 0o755)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: tree + "/src/a.txt"), "plaintext intact")
+    }
+
+    func testTurningEncryptionOffAndOnAgainEncryptsTheNewCheckpoints() async throws {
+        let job = fixture.job
+        try fixture.write("a.txt", "alpha")
+        let runner = BackupRunner()
+        _ = try await runner.run(job: job, forceCheckpoint: true) { _ in }      // checkpoint 1
+        try await makeRepo(for: job, password: "pw")
+        try await runner.migrateToEncrypted(job: job, password: "pw") { _, _ in }
+
+        // Encryption off: plaintext passes start a new history — at checkpoint 1 again.
+        try fixture.write("a.txt", "beta!")
+        _ = try await runner.run(job: job, forceCheckpoint: true) { _ in }
+        XCTAssertEqual(try fixture.store().checkpoints().map(\.seq), [1])
+        try await runner.migrateToEncrypted(job: job, password: "pw") { _, _ in }   // and on again
+
+        let points = try await runner.history(for: job).points
+        XCTAssertEqual(points.map(\.isBrowsable), [false, false], "the new checkpoint 1 is encrypted, not taken for the old")
+        guard case let .encryptedSnapshot(newest) = try XCTUnwrap(points.first).source else { return XCTFail() }
+        let backend = try LocalBackend(root: BackupRunner.jobRoot(for: job).appendingPathComponent("repo"))
+        let (config, keys) = try await RepoManager.unlock(backend: backend, password: Data("pw".utf8))
+        let restored = fixture.root.appendingPathComponent("restored", isDirectory: true)
+        try await DedupEngine(backend: backend, keys: keys, chunker: config.chunker).restore(snapshotID: newest, to: restored)
+        XCTAssertEqual(try String(contentsOf: restored.appendingPathComponent("src/a.txt"), encoding: .utf8), "beta!")
+    }
+
+    func testMigrationKeepsSourcesSinceRemovedFromTheJob() async throws {
+        let other = fixture.root.appendingPathComponent("other", isDirectory: true)
+        try FileManager.default.createDirectory(at: other, withIntermediateDirectories: true)
+        try Data("bravo".utf8).write(to: other.appendingPathComponent("b.txt"))
+        var both = fixture.job
+        both.sources = [fixture.source, other]
+        try fixture.write("a.txt", "alpha")
+        try fixture.pass(at: 0, job: both)                        // checkpoint 1 holds src and other
+        try fixture.pass(at: 16, force: true)                     // other dropped from the job: checkpoint 2
+
+        try await makeRepo(for: fixture.job, password: "pw")
+        let runner = BackupRunner()
+        try await runner.migrateToEncrypted(job: fixture.job, password: "pw") { _, _ in }
+        let encrypted = try await runner.history(for: fixture.job).points.sorted { $0.time < $1.time }
+        guard case let .encryptedSnapshot(first) = try XCTUnwrap(encrypted.first).source else { return XCTFail() }
+
+        let backend = try LocalBackend(root: BackupRunner.jobRoot(for: fixture.job).appendingPathComponent("repo"))
+        let (config, keys) = try await RepoManager.unlock(backend: backend, password: Data("pw".utf8))
+        let restored = fixture.root.appendingPathComponent("restored", isDirectory: true)
+        try await DedupEngine(backend: backend, keys: keys, chunker: config.chunker).restore(snapshotID: first, to: restored)
+        XCTAssertEqual(try String(contentsOf: restored.appendingPathComponent("src/a.txt"), encoding: .utf8), "alpha")
+        XCTAssertEqual(try String(contentsOf: restored.appendingPathComponent("other/b.txt"), encoding: .utf8), "bravo",
+                       "checkpoint 1 still had the removed source")
     }
 
     // MARK: - End to end through the runner

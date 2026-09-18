@@ -6,7 +6,7 @@
 //  @author      Kennt Kim
 //  @company     Calida Lab
 //  @created     2026-06-29
-//  @lastUpdated 2026-09-18
+//  @lastUpdated 2026-09-19
 //
 //  Notes:
 //  - Uses lstat directly (not URLResourceValues) so we get exact (st_dev, st_ino, st_nlink, st_blocks)
@@ -43,6 +43,8 @@ struct FileEntry: Sendable {
     let nlink: nlink_t
     /// Allocated 512-byte blocks (st_blocks) — used for honest "added bytes" accounting.
     let blocks: Int64
+    /// BSD flags (st_flags), e.g. UF_IMMUTABLE for a file locked in Finder.
+    var flags: UInt32 = 0
 
     /// True when this is a regular file referenced by more than one path (a hardlink).
     var isHardlinked: Bool { !isDirectory && !isSymlink && nlink > 1 }
@@ -181,7 +183,8 @@ enum FileWalker {
             dev: st.st_dev,
             ino: st.st_ino,
             nlink: st.st_nlink,
-            blocks: Int64(st.st_blocks)
+            blocks: Int64(st.st_blocks),
+            flags: st.st_flags
         )
     }
 }

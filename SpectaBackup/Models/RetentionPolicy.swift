@@ -6,7 +6,7 @@
 //  @author      Kennt Kim
 //  @company     Calida Lab
 //  @created     2026-06-29
-//  @lastUpdated 2026-09-18
+//  @lastUpdated 2026-09-19
 //
 //  Notes:
 //  - Free-space decisions must be driven by live `statfs` at thinning time, NOT by summing backup
@@ -18,7 +18,7 @@ import Foundation
 
 struct RetentionPolicy: Codable, Sendable, Hashable {
     enum Mode: Codable, Sendable, Hashable {
-        /// Time Machine style: hourly kept 24h, daily kept ~30d, weekly beyond.
+        /// Time Machine style: all kept 24h, daily kept ~30d, weekly beyond (local days from 05:00).
         case automatic
         /// Keep only the most recent N restore points.
         case keepCount(Int)

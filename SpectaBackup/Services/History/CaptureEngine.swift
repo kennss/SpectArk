@@ -8,13 +8,15 @@
 //  @author      Kennt Kim
 //  @company     Calida Lab
 //  @created     2026-09-18
-//  @lastUpdated 2026-09-18
+//  @lastUpdated 2026-09-19
 //
 //  Notes:
 //  - What to compare comes from the FSEvents journal (ChangeJournal): only directories whose contents
 //    changed since the stored cursor, one level each. A full walk happens without a usable cursor, when
 //    the source folder is no longer the verified directory (inode), after a settings or rules change,
-//    when events were lost, and once a day.
+//    when events were lost, and once a day. Why a source is walked in full is logged (subsystem
+//    ai.calidalab.spectabackup, category history): a full walk of a large source is slow, and the reason
+//    is otherwise gone once the pass has moved the cursor on.
 //  - The journal only says where to look. A reported directory is compared as itself only if its path
 //    reaches it without a symlink and in the letter case on disk (realpath), it is not excluded, and this
 //    pass is not removing it; otherwise its parent's listing decides. A directory is compared whole when
@@ -26,7 +28,9 @@
 //    batches: log intents (commit) → filesystem steps with plain fsync → sync touched directories →
 //    resolve (commit = F_FULLFSYNC). A catalog row never points at data not yet on stable storage.
 //  - Put = copy the source to a temp beside the target, fsync it, retire the old item (move it to
-//    versions/ if a checkpoint contains it, else unlink it), rename the temp over the target.
+//    versions/ if a checkpoint contains it, else unlink it), rename the temp over the target. The copy
+//    drops the source's lock flags (UF_IMMUTABLE/UF_APPEND forbid those renames); the catalog records
+//    them and restore puts them back.
 //  - Recovery decides each leftover intent from the disk: temp present? target still the old inode?
 //    old already retired? Roll forward only when the new file is fully in place; otherwise roll back
 //    and let the next pass redo the work.
@@ -39,6 +43,7 @@
 
 import Darwin
 import Foundation
+import os
 
 struct CaptureOutcome: Sendable {
     /// Items added, replaced or removed in current/.
@@ -108,6 +113,7 @@ struct CaptureEngine: Sendable {
         // A pristine catalog owns nothing: anything in current/ or versions/ is the leftover of an
         // interrupted seed (HistorySeeder) and would otherwise linger untracked.
         if recovered == 0, try store.isPristine() { try HistorySeeder(layout: layout).clearLeftovers() }
+        if try !store.mirrorLocksChecked() { try unlockMirror(store) }
         var sealed: [HistoryCheckpoint] = []
 
         // A state the previous pass left unsealed becomes a checkpoint once spacing allows (docs §3.3.2).
@@ -151,6 +157,8 @@ struct CaptureEngine: Sendable {
     /// A full scan is forced at least this often, even when the journal looks complete.
     static let safetyScanInterval: TimeInterval = 86_400
 
+    private static let log = Logger(subsystem: "ai.calidalab.spectabackup", category: "history")
+
     /// One directory to compare: one level, or its whole subtree.
     private struct ScanUnit {
         let source: URL
@@ -189,12 +197,21 @@ struct CaptureEngine: Sendable {
             let name = source.lastPathComponent
             let cursorAtStart = ChangeJournal.cursorNow(for: source)   // before anything is read
             let stored = try store.journalCursor(for: name)
-            var changes = JournalChanges.fullScan(reason: "no usable cursor")
-            if !settingsChanged, !safetyDue, let stored, try rootIsVerified(source, name: name, store: store) {
-                changes = ChangeJournal.changes(in: source, since: stored, exclusions: exclusions)
+            let changes: JournalChanges
+            if settingsChanged {
+                changes = .fullScan(reason: "settings or built-in rules changed")
+            } else if safetyDue {
+                changes = .fullScan(reason: "daily safety scan")
+            } else if let stored {
+                changes = try rootIsVerified(source, name: name, store: store)
+                    ? ChangeJournal.changes(in: source, since: stored, exclusions: exclusions)
+                    : .fullScan(reason: "source folder is not the verified directory")
+            } else {
+                changes = .fullScan(reason: "no cursor stored")
             }
             switch changes {
-            case .fullScan:
+            case let .fullScan(reason):
+                Self.log.notice("full scan of \(name, privacy: .public): \(reason, privacy: .public)")
                 scope.units.append(ScanUnit(source: source, name: name, rel: "", recursive: true))
                 scope.cursors.updateValue(cursorAtStart, forKey: name)   // nil (no journal) clears it
                 scope.fullyScannedSources.insert(name)
@@ -227,7 +244,8 @@ struct CaptureEngine: Sendable {
 
     private enum Operation {
         case addDirectory(path: String)
-        case put(path: String, source: String, kind: HistoryItemKind, size: Int64, mtimeNs: Int64, old: HistoryEntry?)
+        case put(path: String, source: String, kind: HistoryItemKind, size: Int64, mtimeNs: Int64,
+                 lockFlags: UInt32, old: HistoryEntry?)
         case remove(entry: HistoryEntry)
     }
 
@@ -424,7 +442,7 @@ struct CaptureEngine: Sendable {
             }
             guard planned.insert(path).inserted else { return }
             additions.append(.put(path: path, source: item.url.path, kind: kind, size: item.size,
-                                  mtimeNs: item.mtimeNs, old: old))
+                                  mtimeNs: item.mtimeNs, lockFlags: item.flags & Syscalls.lockFlags, old: old))
         }
 
         func removeTree(_ entry: HistoryEntry) throws {
@@ -453,8 +471,9 @@ struct CaptureEngine: Sendable {
             switch op {
             case let .addDirectory(path):
                 return .init(op: .addDirectory, path: path, old: nil, newKind: .directory, newSize: 0, newMtimeNs: 0)
-            case let .put(path, _, kind, size, mtimeNs, old):
-                return .init(op: .put, path: path, old: old, newKind: kind, newSize: size, newMtimeNs: mtimeNs)
+            case let .put(path, _, kind, size, mtimeNs, lockFlags, old):
+                return .init(op: .put, path: path, old: old, newKind: kind, newSize: size, newMtimeNs: mtimeNs,
+                             newLockFlags: lockFlags)
             case let .remove(entry):
                 return .init(op: .remove, path: entry.path, old: entry, newKind: entry.kind, newSize: 0, newMtimeNs: 0)
             }
@@ -474,7 +493,7 @@ struct CaptureEngine: Sendable {
                 try createDirectoryIfNeeded(target)
                 resolutions.append(.applied(intentID: intent.id, path: intent.path,
                                             entry: try newEntry(intent, at: target), retired: nil))
-            case let .put(_, source, kind, size, _, _):
+            case let .put(_, source, kind, size, _, _, _):
                 let temp = layout.temp(for: intent.path, intentID: intent.id)
                 do {
                     try Syscalls.copyItem(at: source, to: temp)
@@ -485,31 +504,35 @@ struct CaptureEngine: Sendable {
                         resolutions.append(.rollback(intentID: intent.id))
                         continue
                     }
-                    try retireOld(intent, touched: &touched)
+                    let lock = try retireOld(intent, touched: &touched)
                     resolutions.append(.applied(intentID: intent.id, path: intent.path, entry: nil,
-                                                retired: retiredIfKept(intent)))
+                                                retired: retiredIfKept(intent, lockFlags: lock)))
                     stats.changed += 1
                     continue
                 }
+                try Syscalls.unlock(temp)
                 if kind != .symlink { try Syscalls.syncToDevice(temp) }
                 try fault(.copied, intent.path)
-                if intent.old != nil { try retireOld(intent, touched: &touched) }
+                var lock: UInt32 = 0
+                if intent.old != nil { lock = try retireOld(intent, touched: &touched) }
                 try fault(.oldRetired, intent.path)
                 try Syscalls.atomicRename(temp, to: target)
                 try fault(.renamed, intent.path)
                 if kind == .symlink { mirror.reset() }
                 resolutions.append(.applied(intentID: intent.id, path: intent.path,
-                                            entry: try newEntry(intent, at: target), retired: retiredIfKept(intent)))
+                                            entry: try newEntry(intent, at: target),
+                                            retired: retiredIfKept(intent, lockFlags: lock)))
                 stats.bytesCopied += size
             case .remove:
+                var lock: UInt32 = 0
                 if intent.old?.kind == .directory {
                     try removeDirectory(target)
                     mirror.reset()
                 } else {
-                    try retireOld(intent, touched: &touched)
+                    lock = try retireOld(intent, touched: &touched)
                 }
                 resolutions.append(.applied(intentID: intent.id, path: intent.path, entry: nil,
-                                            retired: retiredIfKept(intent)))
+                                            retired: retiredIfKept(intent, lockFlags: lock)))
             }
             stats.changed += 1
             stats.processed += 1
@@ -525,22 +548,28 @@ struct CaptureEngine: Sendable {
 
     /// Move the old item into versions/ when a checkpoint contains it, otherwise unlink it. An old item
     /// already missing from current/ (removed behind our back) has nothing to keep; the version row is
-    /// then skipped (see retiredIfKept) rather than failing every future pass.
-    private func retireOld(_ intent: HistoryIntent, touched: inout Set<String>) throws {
+    /// then skipped (see retiredIfKept) rather than failing every future pass. A copy in current/ is never
+    /// locked by the engine, but one can be (locked in Finder, or seeded by an earlier build): the lock is
+    /// lifted — the inode is the mirror's own — and returned, to be kept with the version.
+    private func retireOld(_ intent: HistoryIntent, touched: inout Set<String>) throws -> UInt32 {
         let target = layout.current(intent.path)
-        guard inode(of: target) != nil else { return }
+        guard inode(of: target) != nil else { return 0 }
         if intent.retainsOld {
+            let lock = try Syscalls.flags(of: target) & Syscalls.lockFlags
+            if lock != 0 { try Syscalls.unlock(target) }
             let shard = layout.versionShard(intent.storedName)
             try FileManager.default.createDirectory(atPath: shard, withIntermediateDirectories: true)
             try Syscalls.atomicRename(target, to: layout.version(intent.storedName))
             touched.insert(shard)
-        } else {
-            try removeItem(target)
+            return lock
         }
+        try removeItem(target)
+        return 0
     }
 
-    private func retired(_ intent: HistoryIntent) -> RetiredVersion? {
-        guard intent.retainsOld, let old = intent.old else { return nil }
+    private func retired(_ intent: HistoryIntent, lockFlags: UInt32 = 0) -> RetiredVersion? {
+        guard intent.retainsOld, var old = intent.old else { return nil }
+        old.lockFlags |= lockFlags
         return RetiredVersion(old: old, died: intent.generation,
                               stored: old.kind == .directory ? nil : intent.storedName)
     }
@@ -549,7 +578,8 @@ struct CaptureEngine: Sendable {
         var st = Darwin.stat()
         guard lstat(target, &st) == 0 else { throw InfraError(operation: "lstat", path: target, code: errno) }
         return HistoryEntry(path: intent.path, kind: intent.newKind, size: intent.newSize,
-                            mtimeNs: intent.newMtimeNs, born: intent.generation, mirrorIno: UInt64(st.st_ino))
+                            mtimeNs: intent.newMtimeNs, born: intent.generation, mirrorIno: UInt64(st.st_ino),
+                            lockFlags: intent.newLockFlags)
     }
 
     private func fault(_ step: Step, _ path: String) throws {
@@ -606,6 +636,7 @@ struct CaptureEngine: Sendable {
                 if intent.old != nil && targetIno == nil {
                     // Copy finished (it precedes retiring the old item) and the old item is retired:
                     // only the final rename is missing.
+                    try Syscalls.unlock(temp)
                     try Syscalls.atomicRename(temp, to: target)
                     return try rollForward(true)
                 }
@@ -628,10 +659,25 @@ struct CaptureEngine: Sendable {
     }
 
     /// The retired old item, if it really reached versions/ (directories have nothing to move).
-    private func retiredIfKept(_ intent: HistoryIntent) -> RetiredVersion? {
-        guard let version = retired(intent) else { return nil }
+    private func retiredIfKept(_ intent: HistoryIntent, lockFlags: UInt32 = 0) -> RetiredVersion? {
+        guard let version = retired(intent, lockFlags: lockFlags) else { return nil }
         guard let stored = version.stored else { return version }
         return inode(of: layout.version(stored)) != nil ? version : nil
+    }
+
+    /// Copies in current/ must never be locked (the engine renames and unlinks them). Catalogs from before
+    /// lock flags were handled could have seeded locked copies: once per catalog, unlock them and record
+    /// their flags, which restore then puts back.
+    private func unlockMirror(_ store: HistoryStore) throws {
+        var locks: [String: UInt32] = [:]
+        try FileWalker.walk(root: URL(fileURLWithPath: layout.currentRoot, isDirectory: true),
+                            exclusions: .includeEverything) { item in
+            let lock = item.flags & Syscalls.lockFlags
+            guard lock != 0 else { return }
+            try Syscalls.unlock(item.url.path)
+            locks[item.relativePath] = lock
+        }
+        try store.recordMirrorLocks(locks)
     }
 
     // MARK: - Filesystem helpers
@@ -687,12 +733,6 @@ struct CaptureEngine: Sendable {
     }
 
     private func removeItem(_ path: String) throws {
-        guard inode(of: path) != nil else { return }
-        do {
-            try FileManager.default.removeItem(atPath: path)
-        } catch {
-            try? Syscalls.clearUserFlags(path)   // e.g. uchg copied from the source
-            try FileManager.default.removeItem(atPath: path)
-        }
+        try TreeRemoval.remove(path)
     }
 }

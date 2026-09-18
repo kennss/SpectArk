@@ -6,7 +6,7 @@
 //  @author      Kennt Kim
 //  @company     Calida Lab
 //  @created     2026-06-29
-//  @lastUpdated 2026-07-01
+//  @lastUpdated 2026-09-19
 //
 //  Notes:
 //  - Scenes: a single `Window` (id "dashboard") plus a `MenuBarExtra`. Not WindowGroup — backup
@@ -19,6 +19,7 @@ import SwiftUI
 
 @main
 struct SpectaBackupApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate   // launch, sleep and quit hooks
     @State private var model = AppModel()
     @AppStorage("spectabackup.appearance") private var appearance = "system"
 

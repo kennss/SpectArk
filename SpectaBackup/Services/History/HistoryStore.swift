@@ -8,7 +8,7 @@
 //  @author      Kennt Kim
 //  @company     Calida Lab
 //  @created     2026-09-18
-//  @lastUpdated 2026-09-18
+//  @lastUpdated 2026-09-19
 //
 //  Notes:
 //  - Owned by one capture pass at a time (the BackupRunner actor serialises passes), so it is a plain
@@ -16,6 +16,10 @@
 //  - Durability: WAL + `fullfsync=ON`, so every COMMIT issues F_FULLFSYNC. The capture engine pushes a
 //    batch's file writes with plain fsync and relies on that single cache flush per commit.
 //  - Paths are relative to current/ and always start with the source folder's name ("Developments/a").
+//    They are stored and looked up in Unicode NFC (`key(_:)`): SQLite compares bytes while Swift strings
+//    and APFS/HFS+ names compare by canonical equivalence, so a name spelled NFD on disk (common for
+//    Korean names made in Finder) must map to one row, or a rename that only changes normalization would
+//    leave a ghost row. The file system resolves either spelling to the same file.
 //  - Generations: an entry's `born` is the generation in which that version entered current/; a version
 //    row covers checkpoints `born … died-1`. The pending generation is the next checkpoint's number.
 //  - `parent` (derived from `path` on write; "" at the top) indexes directory listings for browsing.
@@ -24,8 +28,15 @@
 //    compares a directory whose inode differs — replaced by another directory, or unverified — whole.
 //  - Pruning deletes version rows before their files; `sweep_pending` marks a prune whose file deletions
 //    may not have finished, so the next maintenance sweeps versions/ for files no row references.
+//  - `lock_flags`: the source item's UF_IMMUTABLE/UF_APPEND. Copies in current/ and versions/ never carry
+//    them (they forbid the renames the engine relies on); restore puts them back.
+//  - `seeded`: rows placed by HistorySeeder — clones of a legacy snapshot tree, so their blocks are shared
+//    with it for retention accounting. Any replacement clears it.
+//  - Schema version (PRAGMA user_version): 1 = history engine as first shipped (1.2.0 build 8); 2 = lock
+//    flags, seeded rows, NFC path keys. Older catalogs are upgraded in one transaction when opened.
 //
 
+import Darwin
 import Foundation
 import SQLite3
 
@@ -51,6 +62,10 @@ struct HistoryEntry: Equatable, Sendable {
     let mirrorIno: UInt64
     /// Directories: inode of the source directory when its subtree was last fully compared; 0 = not yet.
     var sourceIno: UInt64 = 0
+    /// The source's lock flags (UF_IMMUTABLE/UF_APPEND), re-applied on restore.
+    var lockFlags: UInt32 = 0
+    /// Placed by HistorySeeder (a clone of legacy snapshot data) and not replaced since.
+    var seeded = false
 }
 
 /// A superseded item kept for the checkpoints `born … died-1`.
@@ -64,6 +79,7 @@ struct HistoryVersion: Equatable, Sendable {
     let died: Int64
     /// File name in versions/ (nil for directories, which have no content to keep).
     let stored: String?
+    var lockFlags: UInt32 = 0
 }
 
 /// One item as browsed at a checkpoint (or in current/). `stored` is set when its content lives in
@@ -74,6 +90,8 @@ struct HistoryItemRecord: Equatable, Sendable {
     let size: Int64
     let mtimeNs: Int64
     let stored: String?
+    /// Lock flags to put back on a restored copy.
+    var lockFlags: UInt32 = 0
 
     var name: String { (path as NSString).lastPathComponent }
 }
@@ -102,6 +120,8 @@ struct HistoryIntent: Equatable, Sendable {
     let newKind: HistoryItemKind
     let newSize: Int64
     let newMtimeNs: Int64
+    /// Lock flags of the new item's source.
+    var newLockFlags: UInt32 = 0
     /// Generation the new item is born in (the pending generation when logged).
     let generation: Int64
 
@@ -141,6 +161,8 @@ final class HistoryStore {
     }
 
     private var db: OpaquePointer?
+    /// current/ beside the catalog (HistoryLayout), consulted only by the schema upgrade.
+    private let mirrorRoot: String
 
     init(path: String) throws {
         var handle: OpaquePointer?
@@ -151,9 +173,10 @@ final class HistoryStore {
             throw StoreError.open(path: path, code: code)
         }
         db = handle
+        mirrorRoot = (path as NSString).deletingLastPathComponent + "/current"
+        try exec("PRAGMA busy_timeout=5000;")   // first: even switching the journal mode can meet a lock
         try exec("PRAGMA journal_mode=WAL;")
         try exec("PRAGMA fullfsync=ON;")
-        try exec("PRAGMA busy_timeout=5000;")
         try migrate()
     }
 
@@ -161,9 +184,17 @@ final class HistoryStore {
         if let db { sqlite3_close_v2(db) }
     }
 
+    /// The stored form of a catalog path: Unicode NFC (see the notes above).
+    static func key(_ path: String) -> String {
+        path.precomposedStringWithCanonicalMapping
+    }
+
     // MARK: - Schema
 
+    static let schemaVersion: Int64 = 2
+
     private func migrate() throws {
+        // Version 1, as first shipped; later versions are applied on top.
         try exec("""
             CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS entries (
@@ -212,6 +243,124 @@ final class HistoryStore {
                 generation INTEGER NOT NULL
             );
             """)
+        guard try userVersion() < Self.schemaVersion else { return }
+        let hadEntries = try exists("SELECT 1 FROM entries LIMIT 1;")
+        try transaction {
+            try addColumn("entries", "lock_flags INTEGER NOT NULL DEFAULT 0")
+            try addColumn("entries", "seeded INTEGER NOT NULL DEFAULT 0")
+            try addColumn("versions", "lock_flags INTEGER NOT NULL DEFAULT 0")
+            try addColumn("intents", "old_flags INTEGER NOT NULL DEFAULT 0")
+            try addColumn("intents", "new_flags INTEGER NOT NULL DEFAULT 0")
+            try normalizeStoredPaths()
+            // A new catalog has no mirror copies that an earlier build could have left locked.
+            if !hadEntries { try setMeta("mirror_locks_checked", "1") }
+            try exec("PRAGMA user_version = \(Self.schemaVersion);")
+        }
+    }
+
+    private func exists(_ sql: String) throws -> Bool {
+        let stmt = try prepare(sql)
+        defer { sqlite3_finalize(stmt) }
+        return sqlite3_step(stmt) == SQLITE_ROW
+    }
+
+    private func userVersion() throws -> Int64 {
+        let stmt = try prepare("PRAGMA user_version;")
+        defer { sqlite3_finalize(stmt) }
+        return sqlite3_step(stmt) == SQLITE_ROW ? sqlite3_column_int64(stmt, 0) : 0
+    }
+
+    private func addColumn(_ table: String, _ definition: String) throws {
+        let name = String(definition.prefix { $0 != " " })
+        let info = try prepare("PRAGMA table_info(\(table));")
+        defer { sqlite3_finalize(info) }
+        while sqlite3_step(info) == SQLITE_ROW {
+            if columnText(info, 1) == name { return }
+        }
+        try exec("ALTER TABLE \(table) ADD COLUMN \(definition);")
+    }
+
+    /// Version 2 stores paths in NFC. Rewrite version-1 rows spelled otherwise (byte comparison: Swift's
+    /// `==` would call them equal). Two entries for one name can only be a ghost and its successor. The
+    /// live one is the row whose mirror inode is the file now in current/; failing that, the one born
+    /// later (an upsert keeps a row's rowid, so insertion order proves nothing).
+    private func normalizeStoredPaths() throws {
+        func differs(_ a: String, _ b: String) -> Bool { !a.utf8.elementsEqual(b.utf8) }
+
+        var entryRenames: [(rowid: Int64, key: String, born: Int64, ino: UInt64)] = []
+        let entries = try prepare("SELECT rowid, path, born, mirror_ino FROM entries;")
+        while sqlite3_step(entries) == SQLITE_ROW {
+            let path = columnText(entries, 1) ?? ""
+            if differs(Self.key(path), path) {
+                entryRenames.append((sqlite3_column_int64(entries, 0), Self.key(path), sqlite3_column_int64(entries, 2),
+                                     UInt64(bitPattern: sqlite3_column_int64(entries, 3))))
+            }
+        }
+        sqlite3_finalize(entries)
+        let occupant = try prepare("SELECT rowid, born, mirror_ino FROM entries WHERE path = ?;")
+        let deleteRow = try prepare("DELETE FROM entries WHERE rowid = ?;")
+        let renameEntry = try prepare("UPDATE entries SET path = ?, parent = ? WHERE rowid = ?;")
+        defer { [occupant, deleteRow, renameEntry].forEach { sqlite3_finalize($0) } }
+        for rename in entryRenames {
+            sqlite3_reset(occupant)
+            sqlite3_clear_bindings(occupant)
+            bindText(occupant, 1, rename.key)
+            if sqlite3_step(occupant) == SQLITE_ROW {
+                let other = (rowid: sqlite3_column_int64(occupant, 0), born: sqlite3_column_int64(occupant, 1),
+                             ino: UInt64(bitPattern: sqlite3_column_int64(occupant, 2)))
+                var st = Darwin.stat()
+                let onDisk: UInt64? = lstat(mirrorRoot + "/" + rename.key, &st) == 0 ? UInt64(st.st_ino) : nil
+                // The disk decides when exactly one row names the file there; otherwise the later born.
+                let otherMatches = onDisk == other.ino, mineMatches = onDisk == rename.ino
+                let otherIsLive = otherMatches != mineMatches ? otherMatches : other.born > rename.born
+                if otherIsLive {
+                    try run(deleteRow) { sqlite3_bind_int64($0, 1, rename.rowid) }
+                    continue
+                }
+                try run(deleteRow) { sqlite3_bind_int64($0, 1, other.rowid) }
+            }
+            try run(renameEntry) { stmt in
+                self.bindText(stmt, 1, rename.key)
+                self.bindText(stmt, 2, Self.parent(of: rename.key))
+                sqlite3_bind_int64(stmt, 3, rename.rowid)
+            }
+        }
+
+        for (table, setParent) in [("versions", true), ("intents", false)] {
+            var renames: [(id: Int64, key: String)] = []
+            let rows = try prepare("SELECT id, path FROM \(table);")
+            while sqlite3_step(rows) == SQLITE_ROW {
+                let path = columnText(rows, 1) ?? ""
+                if differs(Self.key(path), path) { renames.append((sqlite3_column_int64(rows, 0), Self.key(path))) }
+            }
+            sqlite3_finalize(rows)
+            let update = try prepare(setParent ? "UPDATE \(table) SET path = ?, parent = ? WHERE id = ?;"
+                                               : "UPDATE \(table) SET path = ? WHERE id = ?;")
+            defer { sqlite3_finalize(update) }
+            for rename in renames {
+                try run(update) { stmt in
+                    self.bindText(stmt, 1, rename.key)
+                    if setParent {
+                        self.bindText(stmt, 2, Self.parent(of: rename.key))
+                        sqlite3_bind_int64(stmt, 3, rename.id)
+                    } else {
+                        sqlite3_bind_int64(stmt, 2, rename.id)
+                    }
+                }
+            }
+        }
+
+        // Journal cursors are keyed by source name.
+        var cursorKeys: [String] = []
+        let keys = try prepare("SELECT key FROM meta WHERE key LIKE 'journal:%';")
+        while sqlite3_step(keys) == SQLITE_ROW { cursorKeys.append(columnText(keys, 0) ?? "") }
+        sqlite3_finalize(keys)
+        for key in cursorKeys where differs(Self.key(key), key) {
+            if let value = try metaText(key) {
+                try deleteMeta(key)
+                try setMeta(Self.key(key), value)
+            }
+        }
     }
 
     // MARK: - State
@@ -232,31 +381,26 @@ final class HistoryStore {
 
     // MARK: - Queries
 
+    private static let entryColumns = "path, kind, size, mtime_ns, born, mirror_ino, source_ino, lock_flags, seeded"
+
     func allEntries() throws -> [String: HistoryEntry] {
-        let stmt = try prepare("SELECT path, kind, size, mtime_ns, born, mirror_ino, source_ino FROM entries;")
-        defer { sqlite3_finalize(stmt) }
-        var result: [String: HistoryEntry] = [:]
-        while sqlite3_step(stmt) == SQLITE_ROW {
-            let entry = readEntry(stmt, from: 0)
-            result[entry.path] = entry
-        }
-        return result
+        try entryMap("SELECT \(Self.entryColumns) FROM entries;", [])
     }
 
     func entry(at path: String) throws -> HistoryEntry? {
-        let stmt = try prepare("SELECT path, kind, size, mtime_ns, born, mirror_ino, source_ino FROM entries WHERE path = ?;")
+        let stmt = try prepare("SELECT \(Self.entryColumns) FROM entries WHERE path = ?;")
         defer { sqlite3_finalize(stmt) }
-        bindText(stmt, 1, path)
+        bindPath(stmt, 1, path)
         return sqlite3_step(stmt) == SQLITE_ROW ? readEntry(stmt, from: 0) : nil
     }
 
     /// Versions of one path (or all when nil), oldest first.
     func versions(of path: String? = nil) throws -> [HistoryVersion] {
-        let sql = "SELECT id, path, kind, size, mtime_ns, born, died, stored FROM versions"
+        let sql = "SELECT id, path, kind, size, mtime_ns, born, died, stored, lock_flags FROM versions"
             + (path == nil ? "" : " WHERE path = ?") + " ORDER BY born, id;"
         let stmt = try prepare(sql)
         defer { sqlite3_finalize(stmt) }
-        if let path { bindText(stmt, 1, path) }
+        if let path { bindPath(stmt, 1, path) }
         var rows: [HistoryVersion] = []
         while sqlite3_step(stmt) == SQLITE_ROW {
             rows.append(HistoryVersion(id: sqlite3_column_int64(stmt, 0),
@@ -266,7 +410,8 @@ final class HistoryStore {
                                        mtimeNs: sqlite3_column_int64(stmt, 4),
                                        born: sqlite3_column_int64(stmt, 5),
                                        died: sqlite3_column_int64(stmt, 6),
-                                       stored: columnText(stmt, 7)))
+                                       stored: columnText(stmt, 7),
+                                       lockFlags: UInt32(truncatingIfNeeded: sqlite3_column_int64(stmt, 8))))
         }
         return rows
     }
@@ -298,40 +443,47 @@ final class HistoryStore {
         let newKind: HistoryItemKind
         let newSize: Int64
         let newMtimeNs: Int64
+        var newLockFlags: UInt32 = 0
     }
 
-    /// Log a batch of intents durably (one commit) and return them with their ids.
+    /// Log a batch of intents durably (one commit) and return them with their ids. Paths come back as
+    /// stored (NFC).
     func logIntents(_ drafts: [IntentDraft]) throws -> [HistoryIntent] {
         let generation = try pendingGeneration()
         var logged: [HistoryIntent] = []
         try transaction {
             let stmt = try prepare("""
-                INSERT INTO intents (op, path, old_kind, old_size, old_mtime, old_born, old_ino,
-                                     new_kind, new_size, new_mtime, generation)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                INSERT INTO intents (op, path, old_kind, old_size, old_mtime, old_born, old_ino, old_flags,
+                                     new_kind, new_size, new_mtime, new_flags, generation)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
                 """)
             defer { sqlite3_finalize(stmt) }
             for draft in drafts {
-                sqlite3_reset(stmt)
-                sqlite3_bind_int64(stmt, 1, draft.op.rawValue)
-                bindText(stmt, 2, draft.path)
-                if let old = draft.old {
-                    sqlite3_bind_int64(stmt, 3, old.kind.rawValue)
-                    sqlite3_bind_int64(stmt, 4, old.size)
-                    sqlite3_bind_int64(stmt, 5, old.mtimeNs)
-                    sqlite3_bind_int64(stmt, 6, old.born)
-                    sqlite3_bind_int64(stmt, 7, Int64(bitPattern: old.mirrorIno))
-                } else {
-                    for index in 3...7 { sqlite3_bind_null(stmt, Int32(index)) }
+                let path = Self.key(draft.path)
+                try run(stmt) { stmt in
+                    sqlite3_bind_int64(stmt, 1, draft.op.rawValue)
+                    self.bindText(stmt, 2, path)
+                    if let old = draft.old {
+                        sqlite3_bind_int64(stmt, 3, old.kind.rawValue)
+                        sqlite3_bind_int64(stmt, 4, old.size)
+                        sqlite3_bind_int64(stmt, 5, old.mtimeNs)
+                        sqlite3_bind_int64(stmt, 6, old.born)
+                        sqlite3_bind_int64(stmt, 7, Int64(bitPattern: old.mirrorIno))
+                        sqlite3_bind_int64(stmt, 8, Int64(old.lockFlags))
+                    } else {
+                        for index in 3...7 { sqlite3_bind_null(stmt, Int32(index)) }
+                        sqlite3_bind_int64(stmt, 8, 0)
+                    }
+                    sqlite3_bind_int64(stmt, 9, draft.newKind.rawValue)
+                    sqlite3_bind_int64(stmt, 10, draft.newSize)
+                    sqlite3_bind_int64(stmt, 11, draft.newMtimeNs)
+                    sqlite3_bind_int64(stmt, 12, Int64(draft.newLockFlags))
+                    sqlite3_bind_int64(stmt, 13, generation)
                 }
-                sqlite3_bind_int64(stmt, 8, draft.newKind.rawValue)
-                sqlite3_bind_int64(stmt, 9, draft.newSize)
-                sqlite3_bind_int64(stmt, 10, draft.newMtimeNs)
-                sqlite3_bind_int64(stmt, 11, generation)
-                try step(stmt)
-                logged.append(HistoryIntent(id: sqlite3_last_insert_rowid(db), op: draft.op, path: draft.path,
+                logged.append(HistoryIntent(id: sqlite3_last_insert_rowid(db), op: draft.op, path: path,
                                             old: draft.old, newKind: draft.newKind, newSize: draft.newSize,
-                                            newMtimeNs: draft.newMtimeNs, generation: generation))
+                                            newMtimeNs: draft.newMtimeNs, newLockFlags: draft.newLockFlags,
+                                            generation: generation))
             }
         }
         return logged
@@ -341,7 +493,7 @@ final class HistoryStore {
     func pendingIntents() throws -> [HistoryIntent] {
         let stmt = try prepare("""
             SELECT id, op, path, old_kind, old_size, old_mtime, old_born, old_ino,
-                   new_kind, new_size, new_mtime, generation
+                   new_kind, new_size, new_mtime, generation, old_flags, new_flags
             FROM intents ORDER BY id;
             """)
         defer { sqlite3_finalize(stmt) }
@@ -354,7 +506,8 @@ final class HistoryStore {
                 size: sqlite3_column_int64(stmt, 4),
                 mtimeNs: sqlite3_column_int64(stmt, 5),
                 born: sqlite3_column_int64(stmt, 6),
-                mirrorIno: UInt64(bitPattern: sqlite3_column_int64(stmt, 7)))
+                mirrorIno: UInt64(bitPattern: sqlite3_column_int64(stmt, 7)),
+                lockFlags: UInt32(truncatingIfNeeded: sqlite3_column_int64(stmt, 12)))
             rows.append(HistoryIntent(id: sqlite3_column_int64(stmt, 0),
                                       op: HistoryIntent.Op(rawValue: sqlite3_column_int64(stmt, 1)) ?? .put,
                                       path: path,
@@ -362,6 +515,7 @@ final class HistoryStore {
                                       newKind: HistoryItemKind(rawValue: sqlite3_column_int64(stmt, 8)) ?? .file,
                                       newSize: sqlite3_column_int64(stmt, 9),
                                       newMtimeNs: sqlite3_column_int64(stmt, 10),
+                                      newLockFlags: UInt32(truncatingIfNeeded: sqlite3_column_int64(stmt, 13)),
                                       generation: sqlite3_column_int64(stmt, 11)))
         }
         return rows
@@ -372,16 +526,16 @@ final class HistoryStore {
         guard !resolutions.isEmpty else { return }
         try transaction {
             let upsert = try prepare("""
-                INSERT INTO entries (path, parent, kind, size, mtime_ns, born, mirror_ino, source_ino)
-                VALUES (?, ?, ?, ?, ?, ?, ?, 0)
+                INSERT INTO entries (path, parent, kind, size, mtime_ns, born, mirror_ino, source_ino, lock_flags, seeded)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, 0)
                 ON CONFLICT(path) DO UPDATE SET kind = excluded.kind, size = excluded.size,
                     mtime_ns = excluded.mtime_ns, born = excluded.born, mirror_ino = excluded.mirror_ino,
-                    source_ino = 0;
+                    source_ino = 0, lock_flags = excluded.lock_flags, seeded = 0;
                 """)
             let deleteEntry = try prepare("DELETE FROM entries WHERE path = ?;")
             let insertVersion = try prepare("""
-                INSERT INTO versions (path, parent, kind, size, mtime_ns, born, died, stored)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+                INSERT INTO versions (path, parent, kind, size, mtime_ns, born, died, stored, lock_flags)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
                 """)
             let deleteIntent = try prepare("DELETE FROM intents WHERE id = ?;")
             defer { [upsert, deleteEntry, insertVersion, deleteIntent].forEach { sqlite3_finalize($0) } }
@@ -393,29 +547,33 @@ final class HistoryStore {
                     try run(deleteIntent) { sqlite3_bind_int64($0, 1, intentID) }
                 case let .applied(intentID, path, entry, retired):
                     if let retired {
+                        let oldPath = Self.key(retired.old.path)
                         try run(insertVersion) { stmt in
-                            self.bindText(stmt, 1, retired.old.path)
-                            self.bindText(stmt, 2, Self.parent(of: retired.old.path))
+                            self.bindText(stmt, 1, oldPath)
+                            self.bindText(stmt, 2, Self.parent(of: oldPath))
                             sqlite3_bind_int64(stmt, 3, retired.old.kind.rawValue)
                             sqlite3_bind_int64(stmt, 4, retired.old.size)
                             sqlite3_bind_int64(stmt, 5, retired.old.mtimeNs)
                             sqlite3_bind_int64(stmt, 6, retired.old.born)
                             sqlite3_bind_int64(stmt, 7, retired.died)
                             if let stored = retired.stored { self.bindText(stmt, 8, stored) } else { sqlite3_bind_null(stmt, 8) }
+                            sqlite3_bind_int64(stmt, 9, Int64(retired.old.lockFlags))
                         }
                     }
                     if let entry {
+                        let entryPath = Self.key(entry.path)
                         try run(upsert) { stmt in
-                            self.bindText(stmt, 1, entry.path)
-                            self.bindText(stmt, 2, Self.parent(of: entry.path))
+                            self.bindText(stmt, 1, entryPath)
+                            self.bindText(stmt, 2, Self.parent(of: entryPath))
                             sqlite3_bind_int64(stmt, 3, entry.kind.rawValue)
                             sqlite3_bind_int64(stmt, 4, entry.size)
                             sqlite3_bind_int64(stmt, 5, entry.mtimeNs)
                             sqlite3_bind_int64(stmt, 6, entry.born)
                             sqlite3_bind_int64(stmt, 7, Int64(bitPattern: entry.mirrorIno))
+                            sqlite3_bind_int64(stmt, 8, Int64(entry.lockFlags))
                         }
                     } else {
-                        try run(deleteEntry) { self.bindText($0, 1, path) }
+                        try run(deleteEntry) { self.bindPath($0, 1, path) }
                     }
                     try run(deleteIntent) { sqlite3_bind_int64($0, 1, intentID) }
                     changed = true
@@ -433,13 +591,8 @@ final class HistoryStore {
         var checkpoint: HistoryCheckpoint?
         try transaction {
             let generation = try pendingGeneration()
-            let totals = try prepare("SELECT COUNT(*), COALESCE(SUM(size), 0) FROM entries WHERE kind != ?;")
-            defer { sqlite3_finalize(totals) }
-            sqlite3_bind_int64(totals, 1, HistoryItemKind.directory.rawValue)
-            guard sqlite3_step(totals) == SQLITE_ROW else { throw sqlError() }
-            let sealed = HistoryCheckpoint(seq: generation, time: time,
-                                           files: sqlite3_column_int64(totals, 0),
-                                           bytes: sqlite3_column_int64(totals, 1))
+            let totals = try currentTotals()
+            let sealed = HistoryCheckpoint(seq: generation, time: time, files: totals.files, bytes: totals.bytes)
             let insert = try prepare("INSERT INTO checkpoints (seq, time, files, bytes) VALUES (?, ?, ?, ?);")
             defer { sqlite3_finalize(insert) }
             sqlite3_bind_int64(insert, 1, sealed.seq)
@@ -458,14 +611,15 @@ final class HistoryStore {
 
     /// Entries directly inside `parent`, by path.
     func entryChildren(of parent: String) throws -> [String: HistoryEntry] {
-        try entryMap("SELECT path, kind, size, mtime_ns, born, mirror_ino, source_ino FROM entries WHERE parent = ?;", [parent])
+        try entryMap("SELECT \(Self.entryColumns) FROM entries WHERE parent = ?;", [Self.key(parent)])
     }
 
     /// Entries strictly below `path` (its whole subtree), by path. A key range on the primary key:
     /// "p/" ≤ path < "p0" ('0' follows '/'), so no LIKE escaping and the index is used.
     func entries(under path: String) throws -> [String: HistoryEntry] {
-        try entryMap("SELECT path, kind, size, mtime_ns, born, mirror_ino, source_ino FROM entries WHERE path >= ? AND path < ?;",
-                     [path + "/", path + "0"])
+        let key = Self.key(path)
+        return try entryMap("SELECT \(Self.entryColumns) FROM entries WHERE path >= ? AND path < ?;",
+                            [key + "/", key + "0"])
     }
 
     private func entryMap(_ sql: String, _ values: [String]) throws -> [String: HistoryEntry] {
@@ -489,7 +643,7 @@ final class HistoryStore {
     }
 
     func journalCursor(for source: String) throws -> JournalCursor? {
-        try metaText("journal:" + source).flatMap { try? JSONDecoder().decode(JournalCursor.self, from: Data($0.utf8)) }
+        try metaText("journal:" + Self.key(source)).flatMap { try? JSONDecoder().decode(JournalCursor.self, from: Data($0.utf8)) }
     }
 
     func carriedDirectories() throws -> [CarriedDirectory] {
@@ -517,16 +671,17 @@ final class HistoryStore {
                 for (path, ino) in verifiedDirectories {
                     try run(update) { stmt in
                         sqlite3_bind_int64(stmt, 1, Int64(bitPattern: ino))
-                        self.bindText(stmt, 2, path)
+                        self.bindPath(stmt, 2, path)
                         sqlite3_bind_int64(stmt, 3, HistoryItemKind.directory.rawValue)
                     }
                 }
             }
             for (source, cursor) in cursors {
+                let key = "journal:" + Self.key(source)
                 if let cursor, let json = String(data: try JSONEncoder().encode(cursor), encoding: .utf8) {
-                    try setMeta("journal:" + source, json)
+                    try setMeta(key, json)
                 } else {
-                    try deleteMeta("journal:" + source)
+                    try deleteMeta(key)
                 }
             }
             let carriedJSON = String(data: try JSONEncoder().encode(carried), encoding: .utf8) ?? "[]"
@@ -542,16 +697,16 @@ final class HistoryStore {
     /// Children of `parent` ("" = the top) as of checkpoint `seq`, or in current/ when nil. Each child
     /// appears once: a path's versions never overlap each other or its current entry.
     func children(of parent: String, at seq: Int64?) throws -> [HistoryItemRecord] {
-        try items(whereClause: "parent = ?", value: parent, at: seq)
+        try items(whereClause: "parent = ?", value: Self.key(parent), at: seq)
     }
 
     /// One path as of checkpoint `seq` (current/ when nil).
     func item(at path: String, seq: Int64?) throws -> HistoryItemRecord? {
-        try items(whereClause: "path = ?", value: path, at: seq).first
+        try items(whereClause: "path = ?", value: Self.key(path), at: seq).first
     }
 
     private func items(whereClause: String, value: String, at seq: Int64?) throws -> [HistoryItemRecord] {
-        let entryColumns = "path, kind, size, mtime_ns, NULL"
+        let entryColumns = "path, kind, size, mtime_ns, NULL, lock_flags"
         let sql: String
         if seq == nil {
             sql = "SELECT \(entryColumns) FROM entries WHERE \(whereClause) ORDER BY path;"
@@ -559,7 +714,7 @@ final class HistoryStore {
             sql = """
                 SELECT \(entryColumns) FROM entries WHERE \(whereClause) AND born <= ?
                 UNION ALL
-                SELECT path, kind, size, mtime_ns, stored FROM versions
+                SELECT path, kind, size, mtime_ns, stored, lock_flags FROM versions
                     WHERE \(whereClause) AND born <= ? AND died > ?
                 ORDER BY path;
                 """
@@ -579,7 +734,8 @@ final class HistoryStore {
                                           kind: HistoryItemKind(rawValue: sqlite3_column_int64(stmt, 1)) ?? .file,
                                           size: sqlite3_column_int64(stmt, 2),
                                           mtimeNs: sqlite3_column_int64(stmt, 3),
-                                          stored: columnText(stmt, 4)))
+                                          stored: columnText(stmt, 4),
+                                          lockFlags: UInt32(truncatingIfNeeded: sqlite3_column_int64(stmt, 5))))
         }
         return rows
     }
@@ -598,6 +754,15 @@ final class HistoryStore {
     /// Total size of the files and symlinks in current/.
     func currentBytes() throws -> Int64 {
         try currentTotals().bytes
+    }
+
+    /// Size of the items in current/ still as seeded — clones sharing their blocks with legacy snapshots.
+    func seededBytes() throws -> Int64 {
+        let stmt = try prepare("SELECT COALESCE(SUM(size), 0) FROM entries WHERE kind != ? AND seeded != 0;")
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_int64(stmt, 1, HistoryItemKind.directory.rawValue)
+        guard sqlite3_step(stmt) == SQLITE_ROW else { throw sqlError() }
+        return sqlite3_column_int64(stmt, 0)
     }
 
     /// Bytes of the kept versions (stored files only).
@@ -627,21 +792,46 @@ final class HistoryStore {
     func seed(_ entries: [HistoryEntry]) throws {
         try transaction {
             let insert = try prepare("""
-                INSERT INTO entries (path, parent, kind, size, mtime_ns, born, mirror_ino, source_ino)
-                VALUES (?, ?, ?, ?, ?, ?, ?, 0);
+                INSERT INTO entries (path, parent, kind, size, mtime_ns, born, mirror_ino, source_ino, lock_flags, seeded)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, 1);
                 """)
             defer { sqlite3_finalize(insert) }
             for entry in entries {
+                let path = Self.key(entry.path)
                 try run(insert) { stmt in
-                    self.bindText(stmt, 1, entry.path)
-                    self.bindText(stmt, 2, Self.parent(of: entry.path))
+                    self.bindText(stmt, 1, path)
+                    self.bindText(stmt, 2, Self.parent(of: path))
                     sqlite3_bind_int64(stmt, 3, entry.kind.rawValue)
                     sqlite3_bind_int64(stmt, 4, entry.size)
                     sqlite3_bind_int64(stmt, 5, entry.mtimeNs)
                     sqlite3_bind_int64(stmt, 6, entry.born)
                     sqlite3_bind_int64(stmt, 7, Int64(bitPattern: entry.mirrorIno))
+                    sqlite3_bind_int64(stmt, 8, Int64(entry.lockFlags))
                 }
             }
+        }
+    }
+
+    // MARK: - Lock flags in current/
+
+    /// Copies in current/ were checked for lock flags (see CaptureEngine.unlockMirror).
+    func mirrorLocksChecked() throws -> Bool {
+        try metaText("mirror_locks_checked") == "1"
+    }
+
+    /// Record lock flags found on (and lifted from) copies in current/, keyed by path below current/,
+    /// and mark the check done — in one commit.
+    func recordMirrorLocks(_ locks: [String: UInt32]) throws {
+        try transaction {
+            let update = try prepare("UPDATE entries SET lock_flags = lock_flags | ? WHERE path = ?;")
+            defer { sqlite3_finalize(update) }
+            for (path, flags) in locks {
+                try run(update) { stmt in
+                    sqlite3_bind_int64(stmt, 1, Int64(flags))
+                    self.bindPath(stmt, 2, path)
+                }
+            }
+            try setMeta("mirror_locks_checked", "1")
         }
     }
 
@@ -723,6 +913,7 @@ final class HistoryStore {
         try step(stmt)
     }
 
+    /// Reads `entryColumns` starting at `column`.
     private func readEntry(_ stmt: OpaquePointer?, from column: Int32) -> HistoryEntry {
         HistoryEntry(path: columnText(stmt, column) ?? "",
                      kind: HistoryItemKind(rawValue: sqlite3_column_int64(stmt, column + 1)) ?? .file,
@@ -730,7 +921,9 @@ final class HistoryStore {
                      mtimeNs: sqlite3_column_int64(stmt, column + 3),
                      born: sqlite3_column_int64(stmt, column + 4),
                      mirrorIno: UInt64(bitPattern: sqlite3_column_int64(stmt, column + 5)),
-                     sourceIno: UInt64(bitPattern: sqlite3_column_int64(stmt, column + 6)))
+                     sourceIno: UInt64(bitPattern: sqlite3_column_int64(stmt, column + 6)),
+                     lockFlags: UInt32(truncatingIfNeeded: sqlite3_column_int64(stmt, column + 7)),
+                     seeded: sqlite3_column_int64(stmt, column + 8) != 0)
     }
 
     private func run(_ stmt: OpaquePointer?, bind: (OpaquePointer?) -> Void) throws {
@@ -765,6 +958,11 @@ final class HistoryStore {
 
     private func bindText(_ stmt: OpaquePointer?, _ index: Int32, _ value: String) {
         sqlite3_bind_text(stmt, index, value, -1, SQLITE_TRANSIENT)
+    }
+
+    /// Bind a catalog path in its stored form.
+    private func bindPath(_ stmt: OpaquePointer?, _ index: Int32, _ path: String) {
+        bindText(stmt, index, Self.key(path))
     }
 
     private func columnText(_ stmt: OpaquePointer?, _ index: Int32) -> String? {

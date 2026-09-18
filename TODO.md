@@ -4,18 +4,11 @@ The core is complete: realtime + scheduled backups with the history engine (ever
 protected within seconds, a restore point at most every 15 minutes, Time Machine thinning —
 [`docs/INCREMENTAL_ENGINE_DESIGN.md`](docs/INCREMENTAL_ENGINE_DESIGN.md)), local + NAS
 destinations, optional encryption, restore, retention, crash recovery of interrupted passes,
-menu-bar metrics, in-app auto-update, and notarized distribution.
+open at login (quietly, in the menu bar), menu-bar metrics, in-app auto-update, and notarized
+distribution.
 
 Below is what's intentionally left for later, roughly in priority order. Nothing here
 is a known bug — these are enhancements.
-
-## P1 — Always-on (core to the "realtime" promise)
-
-- **Launch at login / background residency** (`SMAppService`).
-  Today the app must be *running* to watch FSEvents. The menu-bar item keeps it alive
-  after the window is closed, but a `Cmd-Q` or a reboot stops realtime backup until the
-  user reopens the app. A login item that starts SpectArk in the background at boot is
-  what makes "realtime" actually always-on. This is the most important next step.
 
 ## P2 — Deepest data integrity
 
@@ -49,11 +42,20 @@ is a known bug — these are enhancements.
   identity and resolve the live mount point at backup time (match via `getmntinfo`), so remounts
   never orphan a job. Until then, a moved destination shows the "not connected" card and must be
   re-pointed by hand.
-- **Sparsebundle history + restore.** NAS jobs back up with the history engine inside the image;
-  listing their timeline and restoring still need the image attached (read-only) while browsing — and
-  "Last backup" is unknown until the first pass after launch. Keeping the image attached while the app
-  runs (instead of attach/detach per pass) would serve both and save the per-pass attach cost. Also call
-  `hdiutil compact` periodically so pruned versions actually reclaim space.
+- **A writer lock another Mac left behind blocks this one for good.** The image's lock records the
+  writer's host UUID; a lock from another Mac is always respected, since its process cannot be checked
+  from here. If that Mac crashed or lost the share mid-pass, every pass from this Mac fails as "in use by
+  another Mac" until the lock file is removed by hand. Give the lock a heartbeat (the holder rewrites it
+  while attached) and treat one not refreshed for well past the lease's idle time as stale. Related: Macs
+  sharing one destination folder share one image, so an open restore window on one Mac (it holds the
+  image, and so the lock) keeps the others' passes waiting; one image per Mac, as Time Machine does,
+  would remove that contention altogether.
+- **Compact NAS images after retention.** APFS inside a sparsebundle returns no bands to the share
+  on its own (measured: deleting 300 MB inside an image left it at 325 MB until `hdiutil compact`,
+  which took it to 21 MB). Removing a job's backups or migrating them to the encrypted repo already
+  compacts (or removes) the image (`SparsebundleManager.detach(_:reclaim:)`); versions retention drops
+  inside the image are not given back yet. Track what retention freed in the image and compact when the
+  lease detaches an idle image after enough was freed — under the writer lock, like the other reclaims.
 
 ## P4 — Robustness / nice-to-have
 

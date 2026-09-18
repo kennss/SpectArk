@@ -7,7 +7,7 @@
 //  @author      Kennt Kim
 //  @company     Calida Lab
 //  @created     2026-06-30
-//  @lastUpdated 2026-09-18
+//  @lastUpdated 2026-09-19
 //
 
 import Foundation
@@ -21,6 +21,16 @@ enum BackupErrorMessage {
         if let e = error as? RepoCryptoError { return e.description }
         if let e = error as? RepoManagerError { return e.description }
         if let e = error as? BlobStoreError { return e.description }
+        if let e = error as? SparsebundleManager.SBError {
+            switch e {
+            case .locked:
+                return "The backup image on the NAS is in use by another Mac. SpectArk will try again."
+            case .missingImage:
+                return "The backup image is missing from the NAS share."
+            case .noMountPoint, .command:
+                return "The backup image on the NAS couldn’t be opened — is the share still connected?"
+            }
+        }
         if case let FileWalker.WalkError.sourceRootChanged(path) = error {
             return "The folder \((path as NSString).lastPathComponent) disappeared during the backup — was its disk ejected? Nothing was changed; SpectArk will try again."
         }

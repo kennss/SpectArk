@@ -8,7 +8,12 @@
 //  @author      Kennt Kim
 //  @company     Calida Lab
 //  @created     2026-06-29
-//  @lastUpdated 2026-09-18
+//  @lastUpdated 2026-09-19
+//
+//  Notes:
+//  - The sheet holds a browsing session while it is shown (`holdSession`): a NAS job's backups are in an
+//    image, which stays attached until the sheet goes away. Opening it takes seconds over SMB; the
+//    "Opening…" state appears only when it takes noticeably long, so local jobs show no flash.
 //
 
 import SwiftUI
@@ -28,6 +33,9 @@ struct RestoreView: View {
     @State private var conflict: RestoreEngine.ConflictPolicy = .keepBoth
     @State private var isRestoring = false
     @State private var resultMessage: String?
+    @State private var session: BackupRunner.BrowseSession?
+    @State private var isOpening = false
+    @State private var openError: String?
 
     init(job: BackupJob, points: [RestorePoint]) {
         self.job = job
@@ -40,8 +48,8 @@ struct RestoreView: View {
     private var restoresWhole: Bool { point.map { !$0.isBrowsable } ?? false }
 
     private var browser: (any RestoreBrowser)? {
-        guard let point else { return nil }
-        return model.coordinator.browser(jobID: job.id, point: point, sourceName: sourceName)
+        guard let point, let session else { return nil }
+        return model.coordinator.browser(session: session, point: point, sourceName: sourceName)
     }
 
     private var resolvedTarget: URL? {
@@ -70,6 +78,7 @@ struct RestoreView: View {
             footer
         }
         .frame(width: 700, height: 600)
+        .task { await holdSession() }
         .onChange(of: point) { _, _ in selection.removeAll() }
         .onChange(of: sourceName) { _, _ in selection.removeAll() }
     }
@@ -140,10 +149,46 @@ struct RestoreView: View {
                 }
                 .padding(8)
             }
+        } else if let openError {
+            ContentUnavailableView {
+                Label("Can't Open the Backup", systemImage: "externaldrive.badge.exclamationmark")
+            } description: {
+                Text(openError)
+            }
+            .frame(maxHeight: .infinity)
+        } else if isOpening {
+            ProgressView("Opening backup…").frame(maxHeight: .infinity)
+        } else if session == nil {
+            Color.clear.frame(maxHeight: .infinity)   // opening; not long enough to say so yet
         } else {
             ContentUnavailableView("No restore point", systemImage: "clock.badge.questionmark")
                 .frame(maxHeight: .infinity)
         }
+    }
+
+    /// Keep the job's backups open for as long as the sheet is shown: the task is cancelled when it goes.
+    private func holdSession() async {
+        let slow = Task {
+            try await Task.sleep(for: .milliseconds(300))
+            isOpening = true
+        }
+        let opened: BackupRunner.BrowseSession
+        do {
+            opened = try await model.coordinator.beginBrowsing(job.id)
+        } catch {
+            slow.cancel()
+            isOpening = false
+            openError = BackupErrorMessage.describe(error)
+            return
+        }
+        slow.cancel()
+        isOpening = false
+        session = opened
+        while !Task.isCancelled {
+            try? await Task.sleep(for: .seconds(3600))
+        }
+        session = nil
+        model.coordinator.endBrowsing(opened)
     }
 
     // MARK: - Footer

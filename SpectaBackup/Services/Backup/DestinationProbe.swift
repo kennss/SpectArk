@@ -7,7 +7,7 @@
 //  @author      Kennt Kim
 //  @company     Calida Lab
 //  @created     2026-06-29
-//  @lastUpdated 2026-09-18
+//  @lastUpdated 2026-09-19
 //
 //  Notes:
 //  - Tests are real syscalls against the actual volume — never assume from the fs name alone.
@@ -44,9 +44,10 @@ enum DestinationProbe {
 
         return DestinationCapabilities(
             fileSystem: fsKind,
+            isLocal: vol.isLocal,
             supportsClone: supportsClone,
             supportsHardlink: supportsHardlink,
-            hardlinkPersistsRemount: supportsHardlink && fsKind != .smb,
+            hardlinkPersistsRemount: supportsHardlink && vol.isLocal,
             xattrRoundTrip: xattrOK,
             isCaseSensitive: caseSensitive,
             mtimeResolution: mtimeRes,

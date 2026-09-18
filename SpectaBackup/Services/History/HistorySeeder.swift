@@ -8,7 +8,7 @@
 //  @author      Kennt Kim
 //  @company     Calida Lab
 //  @created     2026-09-18
-//  @lastUpdated 2026-09-18
+//  @lastUpdated 2026-09-19
 //
 //  Notes:
 //  - Runs only on a pristine catalog, and the catalog commit is its last step: an interrupted seed leaves
@@ -22,7 +22,9 @@
 //  - Each item is cloned (APFS: no extra space). On a volume without clones (HFS+) files are hard-linked
 //    instead: current/ never modifies a file in place (it replaces by rename, retires by rename, or
 //    unlinks) and legacy trees are read-only, so a shared inode is never written through either name.
-//    Anything neither can place is copied.
+//    Anything neither can place is copied. A locked file (UF_IMMUTABLE/UF_APPEND) is never hard-linked:
+//    its placed copy must drop the lock flags (recorded in the catalog), and a shared inode would drop
+//    them from the legacy snapshot too.
 //  - Durability follows the capture engine's rule: every seeded item is fsynced, and the catalog commit
 //    (F_FULLFSYNC) comes last, so no row can point at an item that is not on stable storage.
 //  - Rows come from lstat of the seeded items. Legacy snapshots keep each file's size and mtime, which is
@@ -61,7 +63,8 @@ struct HistorySeeder: Sendable {
                 try FileWalker.walk(root: URL(fileURLWithPath: legacy, isDirectory: true), exclusions: exclusions) { item in
                     let placed = target + "/" + item.relativePath
                     try place(item, at: placed)
-                    entries.append(try entry(for: name + "/" + item.relativePath, at: placed, generation: generation))
+                    entries.append(try entry(for: name + "/" + item.relativePath, at: placed, generation: generation,
+                                             lockFlags: item.flags & Syscalls.lockFlags))
                 }
             }
             guard !entries.isEmpty else { return 0 }
@@ -87,18 +90,24 @@ struct HistorySeeder: Sendable {
     // MARK: - Placing the legacy tree
 
     /// One legacy item at `destination`: a folder is created (the walk fills it), anything else is
-    /// cloned, else hard-linked (files), else copied.
+    /// cloned, else hard-linked (unlocked files), else copied — and the placed copy is unlocked.
     private func place(_ item: FileEntry, at destination: String) throws {
         if item.isDirectory && !item.isSymlink {
             try FileManager.default.createDirectory(atPath: destination, withIntermediateDirectories: false)
             return
         }
-        if (try? Syscalls.cloneItem(at: item.url.path, to: destination)) != nil { return }
-        if !item.isSymlink, link(item.url.path, destination) == 0 { return }
+        let locked = item.flags & Syscalls.lockFlags != 0
+        if (try? Syscalls.cloneItem(at: item.url.path, to: destination)) != nil {
+            try Syscalls.unlock(destination)
+            return
+        }
+        if !item.isSymlink, !locked, link(item.url.path, destination) == 0 { return }
         try Syscalls.copyItem(at: item.url.path, to: destination)
+        try Syscalls.unlock(destination)
     }
 
-    private func entry(for path: String, at location: String, generation: Int64) throws -> HistoryEntry {
+    private func entry(for path: String, at location: String, generation: Int64,
+                       lockFlags: UInt32 = 0) throws -> HistoryEntry {
         var st = Darwin.stat()
         guard lstat(location, &st) == 0 else { throw InfraError(operation: "lstat", path: location, code: errno) }
         let kind: HistoryItemKind
@@ -112,7 +121,7 @@ struct HistorySeeder: Sendable {
                             size: isDirectory ? 0 : Int64(st.st_size),
                             mtimeNs: isDirectory ? 0 : Int64(st.st_mtimespec.tv_sec) * 1_000_000_000
                                 + Int64(st.st_mtimespec.tv_nsec),
-                            born: generation, mirrorIno: UInt64(st.st_ino))
+                            born: generation, mirrorIno: UInt64(st.st_ino), lockFlags: lockFlags, seeded: true)
     }
 
     private func kind(of path: String) -> HistoryItemKind? {
@@ -123,13 +132,6 @@ struct HistorySeeder: Sendable {
 
     /// Remove a tree, clearing BSD flags (e.g. uchg copied from a source) that block deletion.
     static func removeTree(_ path: String) throws {
-        let fm = FileManager.default
-        guard (try? fm.attributesOfItem(atPath: path)) != nil else { return }
-        if (try? fm.removeItem(atPath: path)) != nil { return }
-        try? Syscalls.clearUserFlags(path)
-        try? FileWalker.walk(root: URL(fileURLWithPath: path, isDirectory: true), exclusions: .includeEverything) {
-            try? Syscalls.clearUserFlags($0.url.path)
-        }
-        try fm.removeItem(atPath: path)
+        try TreeRemoval.remove(path)
     }
 }

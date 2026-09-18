@@ -3,13 +3,14 @@
 //  @description History engine, phase 2 — retention. Planner: Time Machine thinning of checkpoints (same
 //               rules as legacy snapshots), the newest checkpoint always kept, versions pruned exactly
 //               when no kept checkpoint needs them, space pressure and quota dropping the oldest first,
-//               and (phase 4) legacy snapshots and checkpoints thinned as one timeline.
+//               and (phase 4) legacy snapshots and checkpoints thinned as one timeline. Days are local
+//               and begin at 05:00.
 //               Maintenance on a real history: files leave versions/, current/ is untouched, an
 //               interrupted prune is swept next time, and nothing runs while a pass has pending intents.
 //  @author      Kennt Kim
 //  @company     Calida Lab
 //  @created     2026-09-18
-//  @lastUpdated 2026-09-18
+//  @lastUpdated 2026-09-19
 //
 
 import XCTest
@@ -17,7 +18,12 @@ import XCTest
 
 final class HistoryRetentionTests: XCTestCase {
 
-    private let now = Date(timeIntervalSinceReferenceDate: 800_000_000)
+    private let now = Date(timeIntervalSinceReferenceDate: 800_000_000)   // 2026-05-09 06:13:20 UTC
+    private let utc: Calendar = {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(identifier: "UTC")!
+        return calendar
+    }()
     private let hour: TimeInterval = 3600
     private let day: TimeInterval = 86_400
 
@@ -35,14 +41,28 @@ final class HistoryRetentionTests: XCTestCase {
         let checkpoints = [
             checkpoint(1, ageHours: 24 * 70),        // ~10 weeks: weekly bucket A
             checkpoint(2, ageHours: 24 * 69.5),      // same week as 1 ⇒ only the newer (2) survives
-            checkpoint(3, ageHours: 24 * 5 + 2),     // 5 days: daily bucket
-            checkpoint(4, ageHours: 24 * 5 + 1),     // same day ⇒ 3 dropped, 4 kept
+            checkpoint(3, ageHours: 24 * 5 + 1),     // 5 days: daily bucket (05:13)
+            checkpoint(4, ageHours: 24 * 5 + 0.5),   // same day (05:43) ⇒ 3 dropped, 4 kept
             checkpoint(5, ageHours: 3),              // < 24 h: kept
             checkpoint(6, ageHours: 1)               // newest
         ]
         let plan = HistoryRetention.plan(policy: .automatic, checkpoints: checkpoints, versions: [],
-                                         currentBytes: 0, freeBytes: .max, now: now)
+                                         currentBytes: 0, freeBytes: .max, now: now, calendar: utc)
         XCTAssertEqual(plan.checkpoints, [1, 3])
+    }
+
+    func testARetentionDayRunsFromFiveInTheMorning() {
+        func at(_ iso: String) -> Date { ISO8601DateFormatter().date(from: iso)! }
+        let checkpoints = [
+            HistoryCheckpoint(seq: 1, time: at("2026-05-05T23:30:00Z"), files: 0, bytes: 0),
+            HistoryCheckpoint(seq: 2, time: at("2026-05-06T03:00:00Z"), files: 0, bytes: 0),   // the same night
+            HistoryCheckpoint(seq: 3, time: at("2026-05-06T04:59:00Z"), files: 0, bytes: 0),   // still May 5
+            HistoryCheckpoint(seq: 4, time: at("2026-05-06T05:01:00Z"), files: 0, bytes: 0),   // May 6
+            checkpoint(5, ageHours: 1)
+        ]
+        let plan = HistoryRetention.plan(policy: .automatic, checkpoints: checkpoints, versions: [],
+                                         currentBytes: 0, freeBytes: .max, now: now, calendar: utc)
+        XCTAssertEqual(plan.checkpoints, [1, 2], "May 5 keeps its newest (04:59); 05:01 starts May 6")
     }
 
     func testNewestCheckpointIsNeverDropped() {
@@ -119,6 +139,15 @@ final class HistoryRetentionTests: XCTestCase {
         XCTAssertEqual(plan.legacySnapshots, [7, 8], "100 + 100 is short, + 100 is enough")
         XCTAssertTrue(plan.checkpoints.isEmpty)
         XCTAssertTrue(plan.versions.isEmpty)
+    }
+
+    func testSeededCopiesCountOnceAgainstTheQuota() {
+        // A 100-byte source seeded from its only legacy snapshot (whose own copy is those 100 bytes).
+        let policy = RetentionPolicy(mode: .keepAll, maxTotalBytes: 150)
+        let plan = HistoryRetention.plan(policy: policy, checkpoints: [checkpoint(1, ageHours: 1)], versions: [],
+                                         currentBytes: 100, seededBytes: 100,
+                                         legacy: [legacy(7, ageHours: 5, bytes: 100)], freeBytes: .max, now: now)
+        XCTAssertTrue(plan.legacySnapshots.isEmpty, "100 bytes on disk, not 200")
     }
 
     func testTheNewestLegacySnapshotStaysWhileThereIsNoCheckpoint() {

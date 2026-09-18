@@ -8,7 +8,7 @@
 //  @author      Kennt Kim
 //  @company     Calida Lab
 //  @created     2026-09-18
-//  @lastUpdated 2026-09-18
+//  @lastUpdated 2026-09-19
 //
 
 import XCTest
@@ -24,9 +24,9 @@ final class PassSchedulerTests: XCTestCase {
 
     /// Run a pass from start to finish.
     private func runPass(_ s: inout PassScheduler, start: TimeInterval, duration: TimeInterval,
-                         deferred: Int = 0, succeeded: Bool = true,
+                         deferred: Int = 0, succeeded: Bool = true, requested: Bool = false,
                          during: (inout PassScheduler) -> Void = { _ in }) -> PassScheduler.Action {
-        s.workStarted(.pass(quietWindow: RerunPolicy.quietWindow))
+        s.workStarted(.pass(quietWindow: RerunPolicy.quietWindow, requested: requested))
         during(&s)
         return s.passFinished(now: at(start + duration), duration: duration, deferredCount: deferred,
                               succeeded: succeeded)
@@ -95,7 +95,7 @@ final class PassSchedulerTests: XCTestCase {
         // A pass that still defers (quiet window > 0) starting over an armed settle keeps it owed.
         var p = PassScheduler()
         _ = runPass(&p, start: 0, duration: 1, deferred: 1)
-        p.workStarted(.pass(quietWindow: RerunPolicy.quietWindow))
+        p.workStarted(.pass(quietWindow: RerunPolicy.quietWindow, requested: false))
         guard case let .arm(_, window) = p.passFinished(now: at(10), duration: 1, deferredCount: 0,
                                                         succeeded: true) else { return XCTFail() }
         XCTAssertEqual(window, 0)
@@ -105,7 +105,7 @@ final class PassSchedulerTests: XCTestCase {
         var s = PassScheduler()
         _ = runPass(&s, start: 0, duration: 1, deferred: 1)
         XCTAssertEqual(s.manualRequested(), .start(quietWindow: 0, requested: true))   // copies without deferring
-        s.workStarted(.pass(quietWindow: 0))
+        s.workStarted(.pass(quietWindow: 0, requested: true))
         XCTAssertEqual(s.passFinished(now: at(10), duration: 1, deferredCount: 0, succeeded: true), .none)
     }
 
@@ -161,7 +161,35 @@ final class PassSchedulerTests: XCTestCase {
         XCTAssertEqual(s.changeArrived(now: at(5)), .arm(delay: debounce, quietWindow: window))
     }
 
+    // MARK: - Requested passes
+
+    func testAFailedRequestedPassLeavesItsCheckpointToTheRetry() {
+        var s = PassScheduler()
+        guard case let .arm(_, window) = runPass(&s, start: 0, duration: 1, succeeded: false, requested: true) else {
+            return XCTFail("a failed pass arms a retry")
+        }
+        XCTAssertEqual(s.armedPassFired(), .start(quietWindow: window, requested: true))
+        _ = runPass(&s, start: 100, duration: 1)                 // the retry succeeds …
+        _ = s.changeArrived(now: at(200))
+        XCTAssertEqual(s.armedPassFired(), .start(quietWindow: window, requested: false), "… and the debt is paid")
+    }
+
     // MARK: - Migration and stopping
+
+    func testAMigrationNeverOverlapsAPass() {
+        var s = PassScheduler()
+        XCTAssertEqual(s.migrationRequested(), .startMigration, "idle: starts now")
+
+        var busy = PassScheduler()
+        let finished = runPass(&busy, start: 0, duration: 5) { s in
+            XCTAssertEqual(s.migrationRequested(), .none, "waits for the running pass")
+            _ = s.manualRequested()
+        }
+        XCTAssertEqual(finished, .startMigration)
+        busy.workStarted(.migration)
+        XCTAssertEqual(busy.manualRequested(), .none, "a pass waits for the migration")
+        XCTAssertEqual(busy.migrationFinished(now: at(60)), .start(quietWindow: 0, requested: true))
+    }
 
     func testMigrationFinishHonoursWhatArrivedMeanwhile() {
         var changed = PassScheduler()

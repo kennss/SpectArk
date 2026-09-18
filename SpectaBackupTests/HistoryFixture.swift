@@ -6,7 +6,7 @@
 //  @author      Kennt Kim
 //  @company     Calida Lab
 //  @created     2026-09-18
-//  @lastUpdated 2026-09-18
+//  @lastUpdated 2026-09-19
 //
 //  Notes:
 //  - Passes read changes from the FSEvents journal. A change made a moment ago may not have reached
@@ -49,7 +49,7 @@ final class HistoryFixture {
     }
 
     func remove() {
-        try? FileManager.default.removeItem(at: root)
+        try? HistorySeeder.removeTree(root.path)   // clears lock flags a test may have set
     }
 
     func time(_ minutes: Double) -> Date { t0.addingTimeInterval(minutes * 60) }

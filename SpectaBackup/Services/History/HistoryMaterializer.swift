@@ -7,7 +7,7 @@
 //  @author      Kennt Kim
 //  @company     Calida Lab
 //  @created     2026-09-18
-//  @lastUpdated 2026-09-18
+//  @lastUpdated 2026-09-19
 //
 //  Notes:
 //  - Files are cloned (APFS: no extra space), else hard-linked, else copied. The target must be on the
@@ -27,8 +27,9 @@ struct HistoryMaterializer: Sendable {
     let layout: HistoryLayout
 
     /// Build the state at checkpoint `seq` (current/ when nil) under `target`, which must not exist.
-    /// Returns the materialized source folders (`target/<name>`), in `sourceNames` order.
-    func materialize(sourceNames: [String], at seq: Int64?, into target: URL) throws -> [URL] {
+    /// Returns the folders built at its top — one per source the checkpoint holds, including sources
+    /// since removed from the job — sorted by name.
+    func materialize(at seq: Int64?, into target: URL) throws -> [URL] {
         let store = try HistoryStore(path: layout.catalogPath)
         var items: [(path: String, kind: HistoryItemKind, content: String?)] = []
         for entry in try store.allEntries().values where seq.map({ entry.born <= $0 }) ?? true {
@@ -54,7 +55,7 @@ struct HistoryMaterializer: Sendable {
             if item.kind == .file, link(content, destination) == 0 { continue }
             try Syscalls.copyItem(at: content, to: destination)
         }
-        return sourceNames.map { target.appendingPathComponent($0, isDirectory: true) }
-            .filter { fm.fileExists(atPath: $0.path) }
+        return items.filter { $0.kind == .directory && !$0.path.contains("/") }
+            .map { target.appendingPathComponent($0.path, isDirectory: true) }
     }
 }

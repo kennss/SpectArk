@@ -6,7 +6,7 @@
 //  @author      Kennt Kim
 //  @company     Calida Lab
 //  @created     2026-06-29
-//  @lastUpdated 2026-09-18
+//  @lastUpdated 2026-09-19
 //
 
 import SwiftUI
@@ -43,7 +43,10 @@ struct MenuBarView: View {
 
             Divider()
             VStack(spacing: 2) {
-                menuButton("Open Dashboard…", icon: "macwindow") { openWindow(id: AppModel.dashboardWindowID) }
+                menuButton("Open Dashboard…", icon: "macwindow") {
+                    openWindow(id: AppModel.dashboardWindowID)
+                    AppLaunch.dashboardShown()
+                }
                 menuButton("Check for Updates…", icon: "arrow.down.circle") { UpdaterController.shared.checkForUpdates() }
                 menuButton("Quit SpectArk", icon: "power") { NSApplication.shared.terminate(nil) }
             }

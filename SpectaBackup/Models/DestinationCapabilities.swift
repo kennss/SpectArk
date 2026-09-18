@@ -6,7 +6,7 @@
 //  @author      Kennt Kim
 //  @company     Calida Lab
 //  @created     2026-06-29
-//  @lastUpdated 2026-09-18
+//  @lastUpdated 2026-09-19
 //
 //  Notes:
 //  - Direct only on a local volume with full file-system semantics — clonefile (APFS) or hard links that
@@ -39,6 +39,7 @@ enum BackupStrategy: String, Codable, Sendable, Hashable {
     case sparsebundle
 
     static func select(from caps: DestinationCapabilities) -> BackupStrategy {
+        guard caps.isLocal else { return .sparsebundle }   // SMB, NFS, AFP, WebDAV: never the catalog there
         if caps.supportsClone || (caps.supportsHardlink && caps.hardlinkPersistsRemount) { return .direct }
         return .sparsebundle
     }
@@ -46,6 +47,8 @@ enum BackupStrategy: String, Codable, Sendable, Hashable {
 
 struct DestinationCapabilities: Codable, Sendable, Hashable {
     var fileSystem: FileSystemKind
+    /// A local file system (statfs MNT_LOCAL), not a network share of any protocol.
+    var isLocal: Bool
     var supportsClone: Bool
     var supportsHardlink: Bool
     var hardlinkPersistsRemount: Bool
