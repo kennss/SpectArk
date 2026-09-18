@@ -1,14 +1,14 @@
 //
 //  @file        SparsebundleTests.swift
 //  @description Integration test for SparsebundleManager: create an APFS sparsebundle on a simulated
-//               destination, attach it, confirm the inside is APFS (clone strategy), write/read a
+//               destination, attach it, confirm the inside is APFS (written directly), write/read a
 //               file, detach, and confirm the image persists while the mount point is gone.
 //  @author      Kennt Kim
 //  @company     Calida Lab
 //  @created     2026-06-29
-//  @lastUpdated 2026-06-29
+//  @lastUpdated 2026-09-18
 //
-//  Uses real hdiutil; the boot volume is APFS so the embedded image strategy resolves to clone.
+//  Uses real hdiutil; the image's own volume is APFS, so backups inside it are written directly.
 //
 
 import XCTest
@@ -36,10 +36,10 @@ final class SparsebundleTests: XCTestCase {
         var detached = false
         defer { if !detached { SparsebundleManager.detach(attachment) } }
 
-        // Mounted, and inside the image it's APFS → clone strategy is selected.
+        // Mounted, and inside the image it's APFS → written directly.
         XCTAssertTrue(FileManager.default.fileExists(atPath: attachment.mountPoint.path))
         let innerCaps = try DestinationProbe.probe(destination: attachment.mountPoint)
-        XCTAssertEqual(innerCaps.strategy, .clone)
+        XCTAssertEqual(innerCaps.strategy, .direct)
 
         // Write & read inside the image.
         let file = attachment.mountPoint.appendingPathComponent("hello.txt")

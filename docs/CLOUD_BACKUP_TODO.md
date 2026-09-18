@@ -1,10 +1,11 @@
 # Cloud Backup (iCloud / Google Drive) — Design Notes & TODO
 
 **Status: NOT IMPLEMENTED.** Design captured from an adversarial review; frozen pending two open
-decisions (below). The local engine (APFS clone) and NAS engine (hardlink-tree + sparsebundle) are
-done. Cloud needs a **separate content-addressed chunk-dedup engine** (restic/Arq style) because
-`clonefile`/hardlinks — how the local engine shares unchanged data between snapshots — do not exist
-on iCloud or Google Drive.
+decisions (below). The local engine (the history engine — a mirror plus a version store,
+docs/INCREMENTAL_ENGINE_DESIGN.md) is done, and NAS jobs run it inside a sparsebundle. Cloud needs a
+**separate content-addressed chunk-dedup engine** (restic/Arq style): the history engine relies on
+atomic rename, fsync and a local SQLite catalog on the destination, none of which iCloud or Google
+Drive offer.
 
 ---
 
@@ -65,7 +66,7 @@ on iCloud or Google Drive.
 - **Compression:** LZFSE (Apple `Compression` framework — system has **no zstd**) for v1; add zstd
   later via a per-blob compression-type byte. Skip compression for incompressible blobs.
 - **Parent-snapshot fast path:** skip re-chunking unchanged files by comparing size+mtime to the
-  parent snapshot's tree (reuse `SnapshotEngine.isChanged` logic) — big win and respects the
+  parent snapshot's tree (the size+mtime rule the history engine uses) — big win and respects the
   750 GB/day Drive cap.
 - **Consistent source read:** reuse `SourceReadSession` quiet-window deferral; large files can still
   tear across chunks (documented v1 limitation). APFS source snapshot = shared future work with the
@@ -129,7 +130,8 @@ eventually-consistent backends; parent-snapshot metadata fast path.
 - `Services/Backup/FileWalker.swift`, `SourceReadSession.swift` — source walk + consistent-read.
 - `Services/Catalog/CatalogStore.swift` — "repo is truth, SQLite is rebuildable cache" pattern + format versioning.
 - `Models/DestinationCapabilities.swift` — template for `BackendCapabilities`.
-- `Services/Backup/SnapshotEngine.swift` — commit discipline (`.inprogress` → `COMPLETE` → atomic
-  publish) to translate into the cloud "snapshot written last, after durable-by-ID" protocol.
+- `Services/History/CaptureEngine.swift` — commit discipline (intents logged first, data durable
+  before the catalog commit, recovery decided from what is on disk) to translate into the cloud
+  "snapshot written last, after durable-by-ID" protocol.
 - whiplay `Services/Network/GoogleTokenProvider.swift` / `GoogleDriveAccountStore.swift` — OAuth/Keychain reusable.
 - whiplay `Services/Library/iCloudMaterializer.swift` — evidence iCloud Drive forces full-file downloads.

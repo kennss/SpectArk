@@ -1,12 +1,12 @@
 //
 //  @file        BackupRunnerTests.swift
 //  @description Tests for BackupRunner orchestration — in particular that orphaned `.inprogress-*`
-//               trees left by a crashed pass are garbage-collected before the next pass, so a partial
-//               tree can never be mistaken for a valid snapshot.
+//               trees of the 1.1.x snapshot engine are discarded by the next pass: nothing resumes them
+//               any more, and a partial tree must never be mistaken for a valid snapshot.
 //  @author      Kennt Kim
 //  @company     Calida Lab
 //  @created     2026-06-29
-//  @lastUpdated 2026-06-29
+//  @lastUpdated 2026-09-18
 //
 
 import XCTest
@@ -36,7 +36,7 @@ final class BackupRunnerTests: XCTestCase {
         let job = BackupJob(name: "t", sources: [source], destination: dest)
         let runner = BackupRunner()
 
-        _ = try await runner.run(job: job) { _ in }   // first pass creates snapshots/
+        _ = try await runner.run(job: job) { _ in }   // first pass (history engine)
 
         // Simulate a crashed pass: an orphaned in-progress tree with no COMPLETE marker.
         let snapshotsDir = BackupRunner.jobRoot(for: job).appendingPathComponent("snapshots", isDirectory: true)

@@ -7,13 +7,14 @@
 //  @author      Kennt Kim
 //  @company     Calida Lab
 //  @created     2026-06-29
-//  @lastUpdated 2026-06-29
+//  @lastUpdated 2026-09-18
 //
 //  Notes:
 //  - NEVER writes the original in place: copy → temp → rename(over). overwrite clears uchg first.
 //  - Ownership (uid/gid) cannot be restored without root; the running user becomes the owner. The UI
 //    surfaces this. Symlinks are restored as links (COPYFILE_NOFOLLOW), never followed.
 //  - Selected directories are expanded with FileWalker (pre-order: parents created before children).
+//  - `restoreFile` / `ensureDirectory` are also used by HistoryReader to restore checkpoints.
 //
 
 import Darwin
@@ -59,7 +60,8 @@ struct RestoreEngine: Sendable {
             if isDir.boolValue && !isSymlink(srcItem.path) {
                 // Recreate the directory itself, then expand its contents.
                 ensureDirectory(target.appendingPathComponent(rel))
-                try FileWalker.walk(root: srcItem, exclusions: BackupExclusions()) { entry in
+                // A snapshot tree is restored exactly as recorded — backup-time exclusions don't apply.
+                try FileWalker.walk(root: srcItem, exclusions: .includeEverything) { entry in
                     let dst = target.appendingPathComponent(rel).appendingPathComponent(entry.relativePath)
                     if entry.isDirectory {
                         ensureDirectory(dst)
@@ -80,7 +82,9 @@ struct RestoreEngine: Sendable {
 
     // MARK: - Per-file restore (temp + atomic rename)
 
-    private func restoreFile(src: URL, dst: URL, conflict: ConflictPolicy, outcome: inout Outcome) {
+    /// Restore one file or symlink from `src` to `dst` under the conflict policy. Shared with the history
+    /// engine's restore, whose sources live in current/ or versions/.
+    func restoreFile(src: URL, dst: URL, conflict: ConflictPolicy, outcome: inout Outcome) {
         let fm = FileManager.default
         ensureDirectory(dst.deletingLastPathComponent())
 
@@ -111,7 +115,7 @@ struct RestoreEngine: Sendable {
 
     // MARK: - Helpers
 
-    private func ensureDirectory(_ url: URL) {
+    func ensureDirectory(_ url: URL) {
         try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
     }
 

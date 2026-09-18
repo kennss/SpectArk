@@ -7,7 +7,7 @@
 //  @author      Kennt Kim
 //  @company     Calida Lab
 //  @created     2026-06-30
-//  @lastUpdated 2026-07-01
+//  @lastUpdated 2026-09-18
 //
 
 import Foundation
@@ -21,25 +21,16 @@ enum BackupErrorMessage {
         if let e = error as? RepoCryptoError { return e.description }
         if let e = error as? RepoManagerError { return e.description }
         if let e = error as? BlobStoreError { return e.description }
+        if case let FileWalker.WalkError.sourceRootChanged(path) = error {
+            return "The folder \((path as NSString).lastPathComponent) disappeared during the backup — was its disk ejected? Nothing was changed; SpectArk will try again."
+        }
+        // Our syscall wrapper carries a raw errno.
+        if let e = error as? InfraError, let message = message(forPOSIX: e.code) { return message }
 
         let ns = error as NSError
 
         // Prefer the underlying POSIX cause (most disk failures surface here).
-        if let posix = posixCode(ns) {
-            switch posix {
-            case ENOSPC:
-                return "The backup disk is full."
-            case ENOTCONN, ENXIO, EIO, ENODEV:
-                return "The backup disk was disconnected. Reconnect it and try the backup again."
-            case ENOENT, ENOTDIR:
-                return "The backup disk or a file is no longer available — the disk may have been ejected mid-backup."
-            case EACCES, EPERM:
-                return "Permission denied. Grant SpectArk Full Disk Access in System Settings, then quit and reopen the app."
-            case EROFS:
-                return "The backup disk is read-only."
-            default: break
-            }
-        }
+        if let posix = posixCode(ns), let message = message(forPOSIX: posix) { return message }
 
         switch ns.code {
         case NSFileWriteOutOfSpaceError:
@@ -54,6 +45,23 @@ enum BackupErrorMessage {
         }
 
         return "The backup couldn’t finish — the disk may have been disconnected or a file became unavailable."
+    }
+
+    private static func message(forPOSIX code: Int32) -> String? {
+        switch code {
+        case ENOSPC:
+            return "The backup disk is full."
+        case ENOTCONN, ENXIO, EIO, ENODEV:
+            return "The backup disk was disconnected. Reconnect it and try the backup again."
+        case ENOENT, ENOTDIR:
+            return "The backup disk or a file is no longer available — the disk may have been ejected mid-backup."
+        case EACCES, EPERM:
+            return "Permission denied. Grant SpectArk Full Disk Access in System Settings, then quit and reopen the app."
+        case EROFS:
+            return "The backup disk is read-only."
+        default:
+            return nil
+        }
     }
 
     /// Walk the NSUnderlyingError chain to find a POSIX errno, if any.

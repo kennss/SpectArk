@@ -2,12 +2,12 @@
 //  @file        JobDetailView.swift
 //  @description Detail dashboard for a job. Layout (option C): a source⟶destination visual header
 //               (Carbon Copy Cloner style), a row of status/throughput stat cards plus storage and
-//               quota gauges (Arq style), and a snapshot timeline (Time Machine style). Per-job
+//               quota gauges (Arq style), and a timeline of restore points (Time Machine style). Per-job
 //               actions live in the sidebar row's ⋯ menu (not a toolbar here).
 //  @author      Kennt Kim
 //  @company     Calida Lab
 //  @created     2026-06-29
-//  @lastUpdated 2026-07-05
+//  @lastUpdated 2026-09-18
 //
 
 import SwiftUI
@@ -41,7 +41,7 @@ struct JobDetailView: View {
         .navigationTitle(job.name)
         .toolbar { ToolbarItem(placement: .primaryAction) { runButton } }
         // Re-check after history changes AND when a migration ends, so the prompt clears itself.
-        .task(id: "\(state.history.count)-\(state.isMigrating)-\(state.lastError ?? "")") {
+        .task(id: "\(state.restorePoints.count)-\(state.isMigrating)-\(state.lastError ?? "")") {
             plaintextCount = job.encryptionEnabled ? await coordinator.plaintextSnapshotCount(job.id) : 0
             destinationOnline = DestinationStatus.isReachable(job.destination)
         }
@@ -137,15 +137,18 @@ struct JobDetailView: View {
         }
     }
 
-    /// Where clicking the destination card takes you in Finder: straight into this job's snapshot
-    /// folders (skipping the volume root and the opaque per-job UUID directory), so the point-in-time
-    /// backups are right there. Falls back to the job root, then the destination, when snapshots aren't
-    /// browsable — an encrypted repo, or before the first backup has run.
+    /// Where clicking the destination card takes you in Finder: straight into the latest backed-up
+    /// state (current/, skipping the volume root and the opaque per-job UUID directory), else the older
+    /// snapshot folders. Falls back to the job root, then the destination, when nothing is browsable —
+    /// an encrypted repo, or before the first backup has run.
     private var destinationRevealURL: URL {
         let fm = FileManager.default
         let root = BackupRunner.jobRoot(for: job)
-        let snapshots = root.appendingPathComponent("snapshots", isDirectory: true)
-        if !job.encryptionEnabled, fm.fileExists(atPath: snapshots.path) { return snapshots }
+        if !job.encryptionEnabled {
+            let current = URL(fileURLWithPath: HistoryLayout(jobRoot: root).currentRoot, isDirectory: true)
+            let snapshots = root.appendingPathComponent("snapshots", isDirectory: true)
+            for folder in [current, snapshots] where fm.fileExists(atPath: folder.path) { return folder }
+        }
         if fm.fileExists(atPath: root.path) { return root }
         return job.destination
     }
@@ -164,7 +167,7 @@ struct JobDetailView: View {
                          systemImage: "checkmark.circle.fill", tint: .wpDesignYellow)
                 StatCard(title: nextLabel, value: nextValue, systemImage: "calendar")
             }
-            StatCard(title: "Snapshots", value: "\(state.history.count)",
+            StatCard(title: "Restore points", value: "\(state.restorePoints.count)",
                      systemImage: "square.stack.3d.up")
         }
     }
@@ -179,25 +182,25 @@ struct JobDetailView: View {
                              usedFraction: Double(total - free) / Double(total))
             }
             if job.retention.maxTotalBytes > 0 {
-                let used = state.history.reduce(Int64(0)) { $0 + $1.addedBlocks * 512 }
+                let used = state.storageBytes
                 StorageGauge(label: "Backup quota · \(byteString(used)) of \(byteString(job.retention.maxTotalBytes))",
                              usedFraction: Double(used) / Double(job.retention.maxTotalBytes))
             }
         }
     }
 
-    // MARK: - Snapshot timeline
+    // MARK: - Timeline
 
     @ViewBuilder
     private var snapshotsSection: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text("Snapshots").font(.headline)
-            if state.history.isEmpty {
-                Text("No snapshots yet.").foregroundStyle(.secondary)
+            Text("History").font(.headline)
+            if state.restorePoints.isEmpty {
+                Text("No restore points yet.").foregroundStyle(.secondary)
             } else {
-                VStack(spacing: 0) {
-                    ForEach(Array(state.history.enumerated()), id: \.element.id) { index, snap in
-                        timelineRow(snap, isLast: index == state.history.count - 1)
+                LazyVStack(spacing: 0) {
+                    ForEach(Array(state.restorePoints.enumerated()), id: \.element.id) { index, point in
+                        timelineRow(point, isLast: index == state.restorePoints.count - 1)
                     }
                 }
                 .padding(.vertical, 6)
@@ -207,21 +210,31 @@ struct JobDetailView: View {
         }
     }
 
-    private func timelineRow(_ snap: SnapshotRecord, isLast: Bool) -> some View {
+    private func timelineRow(_ point: RestorePoint, isLast: Bool) -> some View {
         HStack(alignment: .top, spacing: 12) {
             VStack(spacing: 0) {
-                Circle().fill(color(for: snap.status)).frame(width: 9, height: 9).padding(.top, 5)
+                Circle().fill(color(for: point.source)).frame(width: 9, height: 9).padding(.top, 5)
                 if !isLast { Rectangle().fill(.quaternary).frame(width: 1.5).frame(maxHeight: .infinity) }
             }
             VStack(alignment: .leading, spacing: 2) {
-                Text(snap.timestamp.formatted(date: .abbreviated, time: .shortened))
+                Text(point.time.formatted(date: .abbreviated, time: .shortened))
                     .font(.callout.weight(.medium))
-                Text("\(snap.fileCount) files · \(byteString(snap.logicalBytes))")
+                Text(caption(for: point))
                     .font(.caption).foregroundStyle(.secondary)
             }
             Spacer()
         }
         .padding(.vertical, 8)
+    }
+
+    private func caption(for point: RestorePoint) -> String {
+        let size = "\(point.fileCount) files · \(byteString(point.bytes))"
+        switch point.source {
+        case .latest: return size + " · Latest — becomes a restore point within 15 minutes"
+        case .checkpoint: return size
+        case .legacySnapshot: return size + " · Earlier snapshot"
+        case .encryptedSnapshot: return size + " · Encrypted"
+        }
     }
 
     // MARK: - Helpers
@@ -231,7 +244,7 @@ struct JobDetailView: View {
             Image(systemName: "lock.open.trianglebadge.exclamationmark")
                 .font(.title3).foregroundStyle(Color.wpDesignYellow)
             VStack(alignment: .leading, spacing: 2) {
-                Text("\(plaintextCount) plaintext snapshot\(plaintextCount == 1 ? "" : "s") not yet encrypted")
+                Text("\(plaintextCount) plaintext restore point\(plaintextCount == 1 ? "" : "s") not yet encrypted")
                     .font(.callout.weight(.medium))
                 Text("Convert them into the encrypted repo, then remove the plaintext copies.")
                     .font(.caption).foregroundStyle(.secondary)
@@ -282,8 +295,8 @@ struct JobDetailView: View {
     }
 
     private var lastBackupText: String {
-        guard let last = state.lastSnapshot else { return "Never" }
-        return last.timestamp.formatted(.relative(presentation: .named))
+        guard let last = state.lastBackup else { return "Never" }
+        return last.formatted(.relative(presentation: .named))
     }
 
     private var nextLabel: String {
@@ -296,7 +309,7 @@ struct JobDetailView: View {
         case .realtime:
             return "Realtime"
         case .interval(let spec):
-            if let next = Scheduler.nextDue(spec: spec, lastBackup: state.lastSnapshot?.timestamp) {
+            if let next = Scheduler.nextDue(spec: spec, lastBackup: state.lastBackup) {
                 return next.formatted(.relative(presentation: .named))
             }
             return "Every \(spec.count) \(spec.unit.rawValue)"
@@ -307,11 +320,10 @@ struct JobDetailView: View {
         ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
     }
 
-    private func color(for status: SnapshotStatus) -> Color {
-        switch status {
-        case .complete: return .wpDesignYellow
-        case .failed: return .wpRed
-        case .inProgress: return .secondary
+    private func color(for source: RestorePoint.Source) -> Color {
+        switch source {
+        case .latest, .checkpoint, .encryptedSnapshot: return .wpDesignYellow
+        case .legacySnapshot: return .secondary
         }
     }
 }

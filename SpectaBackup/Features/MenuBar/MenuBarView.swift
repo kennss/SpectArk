@@ -6,7 +6,7 @@
 //  @author      Kennt Kim
 //  @company     Calida Lab
 //  @created     2026-06-29
-//  @lastUpdated 2026-07-01
+//  @lastUpdated 2026-09-18
 //
 
 import SwiftUI
@@ -77,8 +77,8 @@ struct MenuBarView: View {
             if state.isRunning {
                 Text("↑ \(byteString(Int64(state.throughputBytesPerSec)))/s · \(state.progress.filesProcessed) files")
                     .font(.caption).foregroundStyle(Color.wpDesignYellow)
-            } else if let last = state.lastSnapshot {
-                Text("Last backup \(last.timestamp.formatted(.relative(presentation: .named)))")
+            } else if let last = state.lastBackup {
+                Text("Last backup \(last.formatted(.relative(presentation: .named)))")
                     .font(.caption).foregroundStyle(.secondary)
             } else {
                 Text("Never backed up").font(.caption).foregroundStyle(.secondary)

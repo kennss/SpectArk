@@ -1,13 +1,14 @@
 //
 //  @file        RestoreView.swift
-//  @description Restore sheet: pick a snapshot (and source, if several), browse/select files in a
+//  @description Restore sheet: pick a restore point (and source, if several), browse/select files in a
 //               custom lazy tree (compact rows, circular checks, indentation, hover/selection
-//               highlight), choose a target and conflict policy, then restore. Ownership can't be
-//               restored (non-root) — noted in the footer.
+//               highlight), choose a target and conflict policy, then restore. Checkpoints, the latest
+//               state and legacy snapshots are browsed item by item; an encrypted snapshot is restored
+//               whole. Ownership can't be restored (non-root) — noted in the footer.
 //  @author      Kennt Kim
 //  @company     Calida Lab
 //  @created     2026-06-29
-//  @lastUpdated 2026-06-29
+//  @lastUpdated 2026-09-18
 //
 
 import SwiftUI
@@ -17,9 +18,9 @@ struct RestoreView: View {
     @Environment(\.dismiss) private var dismiss
 
     let job: BackupJob
-    let history: [SnapshotRecord]
+    let points: [RestorePoint]
 
-    @State private var snapshot: SnapshotRecord?
+    @State private var point: RestorePoint?
     @State private var sourceName: String
     @State private var selection = Set<String>()
     @State private var useOriginalLocation = true
@@ -28,27 +29,34 @@ struct RestoreView: View {
     @State private var isRestoring = false
     @State private var resultMessage: String?
 
-    init(job: BackupJob, history: [SnapshotRecord]) {
+    init(job: BackupJob, points: [RestorePoint]) {
         self.job = job
-        self.history = history
-        _snapshot = State(initialValue: history.first { $0.status == .complete })
+        self.points = points
+        _point = State(initialValue: points.first)
         _sourceName = State(initialValue: job.sources.first?.lastPathComponent ?? "")
     }
 
-    private var completeSnapshots: [SnapshotRecord] { history.filter { $0.status == .complete } }
+    /// The selected point is restored whole (an encrypted snapshot), not item by item.
+    private var restoresWhole: Bool { point.map { !$0.isBrowsable } ?? false }
 
-    private var browser: SnapshotBrowser? {
-        guard let snapshot,
-              let root = model.coordinator.snapshotSourceRoot(jobID: job.id,
-                                                              snapshotDirName: snapshot.dirName,
-                                                              sourceName: sourceName)
-        else { return nil }
-        return SnapshotBrowser(sourceRoot: root)
+    private var browser: (any RestoreBrowser)? {
+        guard let point else { return nil }
+        return model.coordinator.browser(jobID: job.id, point: point, sourceName: sourceName)
     }
 
     private var resolvedTarget: URL? {
-        if job.encryptionEnabled { return customTarget }
+        if restoresWhole { return customTarget }
         return useOriginalLocation ? job.sources.first { $0.lastPathComponent == sourceName } : customTarget
+    }
+
+    private func label(for point: RestorePoint) -> String {
+        let time = point.time.formatted(date: .abbreviated, time: .shortened)
+        switch point.source {
+        case .latest: return "\(time) · Latest · \(point.fileCount) files"
+        case .checkpoint: return "\(time) · \(point.fileCount) files"
+        case .legacySnapshot: return "\(time) · Earlier snapshot · \(point.fileCount) files"
+        case .encryptedSnapshot: return "\(time) · Encrypted · \(point.fileCount) files"
+        }
     }
 
     var body: some View {
@@ -62,7 +70,7 @@ struct RestoreView: View {
             footer
         }
         .frame(width: 700, height: 600)
-        .onChange(of: snapshot) { _, _ in selection.removeAll() }
+        .onChange(of: point) { _, _ in selection.removeAll() }
         .onChange(of: sourceName) { _, _ in selection.removeAll() }
     }
 
@@ -86,11 +94,10 @@ struct RestoreView: View {
     private var pickerBar: some View {
         HStack(spacing: 16) {
             HStack(spacing: 8) {
-                Text("Snapshot").foregroundStyle(.secondary)
-                Picker("", selection: $snapshot) {
-                    ForEach(completeSnapshots) { snap in
-                        Text("\(snap.timestamp.formatted(date: .abbreviated, time: .shortened)) · \(snap.fileCount) files")
-                            .tag(snap as SnapshotRecord?)
+                Text("Restore point").foregroundStyle(.secondary)
+                Picker("", selection: $point) {
+                    ForEach(points) { point in
+                        Text(label(for: point)).tag(point as RestorePoint?)
                     }
                 }
                 .labelsHidden()
@@ -117,7 +124,7 @@ struct RestoreView: View {
 
     @ViewBuilder
     private var treeSection: some View {
-        if job.encryptionEnabled {
+        if restoresWhole {
             ContentUnavailableView {
                 Label("Encrypted Snapshot", systemImage: "lock.doc")
             } description: {
@@ -134,7 +141,7 @@ struct RestoreView: View {
                 .padding(8)
             }
         } else {
-            ContentUnavailableView("No snapshot", systemImage: "clock.badge.questionmark")
+            ContentUnavailableView("No restore point", systemImage: "clock.badge.questionmark")
                 .frame(maxHeight: .infinity)
         }
     }
@@ -145,7 +152,7 @@ struct RestoreView: View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(spacing: 10) {
                 Text("Restore to").foregroundStyle(.secondary)
-                if job.encryptionEnabled {
+                if restoresWhole {
                     Button(customTarget?.lastPathComponent ?? "Choose folder…") {
                         customTarget = FolderPicker.pick(prompt: "Choose Restore Target",
                                                          message: "Restore the entire snapshot into this folder.")
@@ -166,7 +173,7 @@ struct RestoreView: View {
                 Spacer()
             }
 
-            if !job.encryptionEnabled {
+            if !restoresWhole {
                 HStack(spacing: 10) {
                     Text("If a file exists").foregroundStyle(.secondary)
                     Picker("", selection: $conflict) {
@@ -185,14 +192,14 @@ struct RestoreView: View {
                     Text(resultMessage).font(.callout).foregroundStyle(.secondary)
                 }
                 if isRestoring { ProgressView().controlSize(.small) }
-                Button(job.encryptionEnabled
+                Button(restoresWhole
                        ? "Restore entire snapshot"
                        : "Restore \(selection.count) item\(selection.count == 1 ? "" : "s")") { performRestore() }
                     .buttonStyle(.borderedProminent)
                     .tint(Color.wpDesignYellow)
                     .foregroundStyle(.black)
-                    .disabled((job.encryptionEnabled ? false : selection.isEmpty)
-                              || resolvedTarget == nil || isRestoring || snapshot == nil)
+                    .disabled((restoresWhole ? false : selection.isEmpty)
+                              || resolvedTarget == nil || isRestoring || point == nil)
             }
         }
         .padding(16)
@@ -201,12 +208,11 @@ struct RestoreView: View {
     // MARK: - Action
 
     private func performRestore() {
-        guard let snapshot, let target = resolvedTarget else { return }
+        guard let point, let target = resolvedTarget else { return }
         isRestoring = true
         resultMessage = nil
 
-        if job.encryptionEnabled {
-            let dir = snapshot.dirName
+        if case let .encryptedSnapshot(dir) = point.source {
             Task {
                 do {
                     try await model.coordinator.restoreEncrypted(jobID: job.id, snapshotDirName: dir, to: target)
@@ -226,7 +232,7 @@ struct RestoreView: View {
         Task {
             do {
                 let outcome = try await model.coordinator.restore(
-                    jobID: job.id, snapshotDirName: snapshot.dirName, sourceName: src,
+                    jobID: job.id, point: point, sourceName: src,
                     relPaths: rels, to: target, conflict: conflictPolicy, progress: { _ in })
                 isRestoring = false
                 var msg = "Restored \(outcome.restored)"
@@ -241,12 +247,12 @@ struct RestoreView: View {
     }
 }
 
-/// One row in the snapshot file tree. Custom (not List) for a compact, modern look: indentation by
-/// depth, an animated chevron for directories, a circular check, and hover/selection highlight.
+/// One row in the restore point's file tree. Custom (not List) for a compact, modern look: indentation
+/// by depth, an animated chevron for directories, a circular check, and hover/selection highlight.
 private struct SnapshotTreeRow: View {
     let entry: SnapshotEntry
     let depth: Int
-    let browser: SnapshotBrowser
+    let browser: any RestoreBrowser
     @Binding var selection: Set<String>
 
     @State private var expanded = false

@@ -9,10 +9,17 @@
 //  @author      Kennt Kim
 //  @company     Calida Lab
 //  @created     2026-06-30
-//  @lastUpdated 2026-06-30
+//  @lastUpdated 2026-09-18
 //
 //  Note: files are currently read whole before chunking; streaming large files through FastCDC is a
 //  later optimization (tracked separately), not a correctness concern for the engine shape.
+//  Exclusions are applied exactly as the plaintext engine's FileWalker applies them (name/glob rules,
+//  then artifact-directory rules), so a job backs up the same set of files either way. Migration of
+//  historical plaintext snapshots passes `.includeEverything` to re-encrypt each tree as it was recorded.
+//  When backing up a live source (`toleratingVanishedEntries`), entries that vanish while it is read
+//  (builds, git) are left out of the snapshot rather than failing it, and each source root is checked
+//  at the end to still be the same directory — the same policy as the plaintext engine (FileWalker).
+//  Re-encrypting a snapshot tree never tolerates anything missing.
 //
 
 import CryptoKit
@@ -41,12 +48,18 @@ struct DedupEngine: Sendable {
     /// Back up one or more source folders into a single snapshot. Each source becomes a named
     /// subdirectory (by `lastPathComponent`) under the snapshot's root tree.
     @discardableResult
-    func backUp(sources: [URL], snapshotID: String, now: Double) async throws -> Snapshot {
+    func backUp(sources: [URL], snapshotID: String, now: Double,
+                exclusions: BackupExclusions, toleratingVanishedEntries tolerant: Bool) async throws -> Snapshot {
         var rootNodes: [TreeNode] = []
         var fileCount = 0
         var totalBytes = 0
         for source in sources {
-            let child = try await backUpDirectory(source)
+            let rootIdentity = try FileWalker.identity(of: source.path)
+            guard let child = try await backUpDirectory(source, relBase: "", exclusions: exclusions,
+                                                        tolerant: tolerant) else {
+                throw FileWalker.WalkError.sourceRootChanged(source.path)
+            }
+            if tolerant { try FileWalker.verifyRootUnchanged(source.path, rootIdentity) }
             rootNodes.append(TreeNode(kind: .directory, name: source.lastPathComponent, treeID: child.treeID))
             fileCount += child.fileCount
             totalBytes += child.bytes
@@ -63,10 +76,30 @@ struct DedupEngine: Sendable {
         return snapshot
     }
 
-    private func backUpDirectory(_ dir: URL) async throws -> (treeID: String, fileCount: Int, bytes: Int) {
-        let entries = try FileManager.default.contentsOfDirectory(
-            at: dir, includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey])
-            .sorted { $0.lastPathComponent < $1.lastPathComponent }
+    /// Back up one directory; nil if it vanished (tolerant walks only) before it could be listed.
+    private func backUpDirectory(_ dir: URL, relBase: String, exclusions: BackupExclusions,
+                                 tolerant: Bool) async throws -> (treeID: String, fileCount: Int, bytes: Int)? {
+        let listed: [URL]
+        do {
+            listed = try FileManager.default.contentsOfDirectory(
+                at: dir, includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+        } catch _ where tolerant && FileWalker.vanished(dir.path, expectDirectory: true) {
+            return nil
+        }
+        let siblingNames = Set(listed.map(\.lastPathComponent))
+        var entries: [(url: URL, rv: URLResourceValues)] = []
+        for entry in listed {
+            let name = entry.lastPathComponent
+            let rel = relBase.isEmpty ? name : relBase + "/" + name
+            if exclusions.isExcluded(relativePath: rel, name: name) { continue }
+            let rv = try entry.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+            if rv.isDirectory == true, rv.isSymbolicLink != true,
+               exclusions.isArtifactDirectory(at: entry, name: name, siblings: { siblingNames.contains($0) }) {
+                continue
+            }
+            entries.append((entry, rv))
+        }
+        entries.sort { $0.url.lastPathComponent < $1.url.lastPathComponent }
 
         var nodes = [TreeNode?](repeating: nil, count: entries.count)
         var fileCount = 0
@@ -75,14 +108,19 @@ struct DedupEngine: Sendable {
 
         // Directories (recursion) and symlinks are handled inline; regular files are collected to be
         // read + chunked + encrypted in parallel below (that's the CPU/IO-heavy part).
-        for (i, entry) in entries.enumerated() {
+        for (i, (entry, rv)) in entries.enumerated() {
             let name = entry.lastPathComponent
-            let rv = try entry.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
             if rv.isSymbolicLink == true {
-                nodes[i] = TreeNode(kind: .symlink, name: name,
-                                    target: try FileManager.default.destinationOfSymbolicLink(atPath: entry.path))
+                do {
+                    nodes[i] = TreeNode(kind: .symlink, name: name,
+                                        target: try FileManager.default.destinationOfSymbolicLink(atPath: entry.path))
+                } catch _ where tolerant && FileWalker.vanished(entry.path) {
+                    continue
+                }
             } else if rv.isDirectory == true {
-                let child = try await backUpDirectory(entry)
+                let rel = relBase.isEmpty ? name : relBase + "/" + name
+                guard let child = try await backUpDirectory(entry, relBase: rel, exclusions: exclusions,
+                                                            tolerant: tolerant) else { continue }
                 nodes[i] = TreeNode(kind: .directory, name: name, treeID: child.treeID)
                 fileCount += child.fileCount
                 bytes += child.bytes
@@ -96,19 +134,26 @@ struct DedupEngine: Sendable {
         let cipher = self.cipher
         let chunker = self.chunker
         let maxConcurrent = max(2, ProcessInfo.processInfo.activeProcessorCount)
-        try await withThrowingTaskGroup(of: SealedFile.self) { group in
+        try await withThrowingTaskGroup(of: SealedFile?.self) { group in
             var next = files.makeIterator()
             var inFlight = 0
             func schedule() {
                 guard let f = next.next() else { return }
-                group.addTask { try Self.sealFile(at: f.url, name: f.name, index: f.index,
-                                                  cipher: cipher, chunker: chunker) }
+                group.addTask {
+                    do {
+                        return try Self.sealFile(at: f.url, name: f.name, index: f.index,
+                                                 cipher: cipher, chunker: chunker)
+                    } catch _ where tolerant && FileWalker.vanished(f.url.path) {
+                        return nil   // deleted while we read it: not part of this snapshot
+                    }
+                }
                 inFlight += 1
             }
             for _ in 0..<maxConcurrent { schedule() }
             while inFlight > 0 {
-                guard let sealed = try await group.next() else { break }
+                guard let result = try await group.next() else { break }
                 inFlight -= 1
+                guard let sealed = result else { schedule(); continue }
                 for blob in sealed.blobs { try await blobStore.addSealed(blobID: blob.id, ciphertext: blob.ct) }
                 nodes[sealed.index] = sealed.node
                 fileCount += 1

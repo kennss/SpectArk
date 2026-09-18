@@ -7,7 +7,7 @@
 //  @author      Kennt Kim
 //  @company     Calida Lab
 //  @created     2026-06-30
-//  @lastUpdated 2026-06-30
+//  @lastUpdated 2026-09-18
 //
 
 import SwiftUI
@@ -96,7 +96,7 @@ struct NewBackupView: View {
             }
             rowDivider
             pickerRow(label: "Destination",
-                      value: destination?.path ?? "Choose where snapshots are stored",
+                      value: destination?.path ?? "Choose where backups are stored",
                       chosen: destination != nil) {
                 destination = FolderPicker.pick(prompt: "Choose Destination",
                                                 message: "Local disk or mounted NAS share.")
@@ -137,8 +137,8 @@ struct NewBackupView: View {
                 }
             }
             Text(isRealtime
-                 ? "Realtime: SpectArk watches this folder and creates a new snapshot automatically whenever files change — no timer, no manual runs. Unlike most backup apps that only run on a schedule, this keeps a near-continuous version history."
-                 : "Scheduled: a new snapshot runs automatically on the interval you set, in the background — SpectArk doesn't need to be the active app.")
+                 ? "Realtime: SpectArk watches this folder and backs up each change within seconds — no timer, no manual runs — keeping a restore point at most every 15 minutes, thinned over time like Time Machine. Unlike most backup apps that only run on a schedule, your latest work is always protected."
+                 : "Scheduled: a backup runs automatically on the interval you set, in the background, and each one is a restore point — SpectArk doesn't need to be the active app.")
                 .font(.caption).foregroundStyle(.secondary).padding(.horizontal, 4)
         }
     }
@@ -165,7 +165,7 @@ struct NewBackupView: View {
             }
             Text(encryptionEnabled
                  ? "Files are chunked, deduplicated, and encrypted (AES-256-GCM). A recovery key is shown once after you create the backup — save it."
-                 : "Off: snapshots are stored as browsable plaintext.")
+                 : "Off: backups are stored as browsable plaintext files.")
                 .font(.caption).foregroundStyle(.secondary).padding(.horizontal, 4)
         }
     }

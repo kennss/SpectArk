@@ -8,11 +8,11 @@
 //  @author      Kennt Kim
 //  @company     Calida Lab
 //  @created     2026-07-01
-//  @lastUpdated 2026-07-01
+//  @lastUpdated 2026-09-18
 //
 //  Notes:
-//  - Only active when running from a real .app bundle; otherwise it stays inert and "Check for
-//    Updates…" is disabled (so it never tries to update a non-bundle build).
+//  - Only active when running from a real .app bundle that is not a unit-test host; otherwise it stays
+//    inert and "Check for Updates…" is disabled (so it never tries to update a non-bundle build).
 //
 
 import SwiftUI
@@ -27,7 +27,7 @@ final class UpdaterController: ObservableObject {
     let canCheck: Bool
 
     private init() {
-        if Bundle.main.bundleURL.pathExtension == "app" {
+        if Bundle.main.bundleURL.pathExtension == "app" && !AppRuntime.isUnitTestHost {
             controller = SPUStandardUpdaterController(startingUpdater: true,
                                                       updaterDelegate: nil, userDriverDelegate: nil)
             canCheck = true

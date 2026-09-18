@@ -1,12 +1,12 @@
 //
 //  @file        SparsebundleManager.swift
-//  @description Manages an APFS sparsebundle disk image on a destination that supports neither
-//               clonefile nor persistent hardlinks (some NAS shares). The image is attached, the
-//               existing clone-strategy engine runs inside its APFS volume, then it is detached.
+//  @description Manages an APFS sparsebundle disk image on a destination that is not a local APFS/HFS+
+//               volume (NAS shares, exFAT/FAT drives). The image is attached, the history engine runs
+//               inside its APFS volume exactly as on a local disk, then it is detached.
 //  @author      Kennt Kim
 //  @company     Calida Lab
 //  @created     2026-06-29
-//  @lastUpdated 2026-06-29
+//  @lastUpdated 2026-09-18
 //
 //  This is the most fragile backup path (review H6) — a network drop can corrupt the embedded
 //  filesystem. Safety measures:

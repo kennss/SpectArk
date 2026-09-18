@@ -7,7 +7,7 @@
 //  @author      Kennt Kim
 //  @company     Calida Lab
 //  @created     2026-06-29
-//  @lastUpdated 2026-07-05
+//  @lastUpdated 2026-09-18
 //
 
 import SwiftUI
@@ -64,24 +64,24 @@ struct DashboardView: View {
         }
         .sheet(item: $settingsJob) { JobSettingsView(job: $0) }
         .sheet(item: $restoreJob) { job in
-            RestoreView(job: job, history: coordinator.state(for: job.id).history)
+            RestoreView(job: job, points: coordinator.state(for: job.id).restorePoints)
         }
         .confirmationDialog(
             "Remove this backup?",
             isPresented: Binding(get: { jobToRemove != nil }, set: { if !$0 { jobToRemove = nil } }),
             presenting: jobToRemove
         ) { job in
-            Button("Remove & Delete All Snapshots", role: .destructive) {
+            Button("Remove & Delete All Backups", role: .destructive) {
                 if selectedJobID == job.id { selectedJobID = nil }
                 coordinator.removeJob(job.id, deleteSnapshots: true)
             }
-            Button("Remove Only (Keep Snapshots on Disk)") {
+            Button("Remove Only (Keep Backups on Disk)") {
                 if selectedJobID == job.id { selectedJobID = nil }
                 coordinator.removeJob(job.id, deleteSnapshots: false)
             }
             Button("Cancel", role: .cancel) {}
         } message: { job in
-            Text("“\(job.name)” will stop being backed up. Also delete its snapshots on \(job.destination.lastPathComponent) to free the space, or keep them on disk.")
+            Text("“\(job.name)” will stop being backed up. Also delete its backups on \(job.destination.lastPathComponent) to free the space, or keep them on disk.")
         }
     }
 
@@ -253,7 +253,7 @@ private struct JobRow: View {
         Button { coordinator.runNow(job.id) } label: { Label("Back Up Now", systemImage: "arrow.clockwise") }
             .disabled(state.isRunning)
         Button(action: onRestore) { Label("Restore…", systemImage: "clock.arrow.circlepath") }
-            .disabled(state.history.isEmpty)
+            .disabled(state.restorePoints.isEmpty)
         Button(action: onSettings) { Label("Settings…", systemImage: "gearshape") }
         Divider()
         Button(role: .destructive, action: onRemove) {
@@ -261,13 +261,11 @@ private struct JobRow: View {
         }
     }
 
-    /// Lock only when encryption is ON and NO plaintext snapshots remain (fully encrypted). A job with
-    /// encryption enabled but plaintext still to migrate shows no lock — the migrate banner covers it.
+    /// Lock only when encryption is ON and NO plaintext restore points remain (fully encrypted). A job
+    /// with encryption enabled but plaintext still to migrate shows no lock — the migrate banner covers it.
     private var showsLock: Bool {
-        guard job.encryptionEnabled, !state.history.isEmpty else { return false }
-        return !state.history.contains {
-            $0.status == .complete && !$0.dirName.isEmpty && !$0.dirName.hasPrefix("enc-")
-        }
+        guard job.encryptionEnabled, !state.restorePoints.isEmpty else { return false }
+        return state.restorePoints.allSatisfy { !$0.isBrowsable }
     }
 }
 

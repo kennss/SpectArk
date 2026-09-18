@@ -1,12 +1,13 @@
 //
 //  @file        JobSettingsView.swift
-//  @description Edit a job's trigger (realtime vs interval), retention policy, and storage limits
-//               (max backup size / minimum free space). Custom grouped-card layout for a clean,
-//               aligned look. Saving persists via the coordinator and restarts watcher/schedule.
+//  @description Edit a job's content filter (skip rebuildable files), trigger (realtime vs interval),
+//               retention policy, and storage limits (max backup size / minimum free space). Custom
+//               grouped-card layout for a clean, aligned look. Saving persists via the coordinator and
+//               restarts watcher/schedule.
 //  @author      Kennt Kim
 //  @company     Calida Lab
 //  @created     2026-06-29
-//  @lastUpdated 2026-06-29
+//  @lastUpdated 2026-09-18
 //
 //  Notes:
 //  - Sizes are entered in GB (decimal, 1 GB = 1,000,000,000 bytes); 0 means "no limit".
@@ -21,6 +22,7 @@ struct JobSettingsView: View {
 
     let job: BackupJob
 
+    @State private var skipsBuildArtifacts: Bool
     @State private var isRealtime: Bool
     @State private var intervalCount: Int
     @State private var intervalUnit: IntervalUnit
@@ -42,7 +44,7 @@ struct JobSettingsView: View {
         var label: String {
             switch self {
             case .automatic: return "Automatic (Time Machine style)"
-            case .keepCount: return "Keep last N snapshots"
+            case .keepCount: return "Keep last N restore points"
             case .keepDays: return "Keep last N days"
             case .keepAll: return "Keep all"
             }
@@ -51,6 +53,7 @@ struct JobSettingsView: View {
 
     init(job: BackupJob) {
         self.job = job
+        _skipsBuildArtifacts = State(initialValue: job.skipsBuildArtifacts)
         if case .interval(let spec) = job.trigger {
             _isRealtime = State(initialValue: false)
             _intervalCount = State(initialValue: spec.count)
@@ -77,6 +80,7 @@ struct JobSettingsView: View {
             Divider()
             ScrollView {
                 VStack(alignment: .leading, spacing: 20) {
+                    contentSection
                     whenSection
                     keepSection
                     storageSection
@@ -114,6 +118,20 @@ struct JobSettingsView: View {
 
     // MARK: - Sections
 
+    private var contentSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            section("What to back up") {
+                row("Skip rebuildable files") {
+                    Toggle("", isOn: $skipsBuildArtifacts).labelsHidden()
+                }
+            }
+            Text(skipsBuildArtifacts
+                 ? "Skips folders your tools can regenerate — dependencies (node_modules, Pods, Python virtual environments), build outputs (Flutter/Gradle build, Cargo/Maven target, SwiftPM .build, Xcode derived data) and caches. A folder is skipped only when its tool is recognized, so your files and Git history are always backed up."
+                 : "Off: everything in the source folders is backed up, including dependencies and build outputs.")
+                .font(.caption).foregroundStyle(.secondary).padding(.horizontal, 4)
+        }
+    }
+
     private var whenSection: some View {
         section("When to back up") {
             row("Trigger") {
@@ -139,7 +157,7 @@ struct JobSettingsView: View {
     }
 
     private var keepSection: some View {
-        section("Keep snapshots") {
+        section("Keep restore points") {
             row("Retention") {
                 Picker("", selection: $retentionKind) {
                     ForEach(RetentionKind.allCases) { Text($0.label).tag($0) }
@@ -162,7 +180,7 @@ struct JobSettingsView: View {
                 rowDivider
                 numberRow("Keep free space", hint: "0 = off", value: $minFreeGB)
             }
-            Text("When a limit is reached, the oldest snapshots are deleted first — useful for a NAS share allowance.")
+            Text("When a limit is reached, the oldest restore points are deleted first — useful for a NAS share allowance.")
                 .font(.caption).foregroundStyle(.secondary).padding(.horizontal, 4)
         }
     }
@@ -189,7 +207,7 @@ struct JobSettingsView: View {
             }
             Text(encryptionEnabled
                  ? "Files are chunked, deduplicated, and encrypted (AES-256-GCM) into a repo. A recovery key is shown once when you first enable it — save it. Any existing plaintext backups are migrated into the encrypted repo (history preserved) and removed only after they are safely re-encrypted."
-                 : "Off: backups are stored as browsable plaintext snapshots.")
+                 : "Off: backups are stored as browsable plaintext files.")
                 .font(.caption).foregroundStyle(.secondary).padding(.horizontal, 4)
         }
     }
@@ -239,6 +257,7 @@ struct JobSettingsView: View {
 
     private func save() {
         var updated = job
+        updated.skipsBuildArtifacts = skipsBuildArtifacts
         updated.trigger = isRealtime
             ? .realtime
             : .interval(IntervalSpec(unit: intervalUnit, count: intervalCount))
@@ -269,8 +288,8 @@ struct JobSettingsView: View {
                         let recovery = try await model.coordinator.enableEncryption(for: updated, password: password)
                         isWorking = false
                         model.coordinator.updateJob(updated)
-                        // Migrate existing plaintext snapshots into the encrypted repo (data + history
-                        // preserved; plaintext removed only after every snapshot is safely re-encrypted).
+                        // Migrate existing plaintext restore points into the encrypted repo (data + history
+                        // preserved; plaintext removed only after every point is safely re-encrypted).
                         if await model.coordinator.plaintextSnapshotCount(updated.id) > 0 {
                             model.coordinator.migrateToEncrypted(updated.id)
                         }

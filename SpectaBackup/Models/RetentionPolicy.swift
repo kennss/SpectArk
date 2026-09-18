@@ -1,16 +1,17 @@
 //
 //  @file        RetentionPolicy.swift
-//  @description Snapshot retention policy. Default is Time Machine-style automatic thinning; the
-//               RetentionManager consumes this to decide which snapshots to delete and when.
+//  @description Retention policy for a job's restore points. Default is Time Machine-style automatic
+//               thinning; HistoryRetention applies it to the job's timeline (1.1.x snapshots, then
+//               checkpoints) to decide which restore points to delete and when.
 //  @author      Kennt Kim
 //  @company     Calida Lab
 //  @created     2026-06-29
-//  @lastUpdated 2026-06-29
+//  @lastUpdated 2026-09-18
 //
 //  Notes:
-//  - Free-space decisions must be driven by live `statfs` at thinning time, NOT by summing snapshot
-//    sizes (shared clone/hardlink blocks would be massively over-counted). `minimumFreeBytes` is the
-//    low-water mark that forces deletion of the oldest snapshots regardless of age policy.
+//  - Free-space decisions must be driven by live `statfs` at thinning time, NOT by summing backup
+//    sizes. `minimumFreeBytes` is the low-water mark that forces deletion of the oldest restore points
+//    regardless of age policy; the newest one is never deleted.
 //
 
 import Foundation
@@ -19,9 +20,9 @@ struct RetentionPolicy: Codable, Sendable, Hashable {
     enum Mode: Codable, Sendable, Hashable {
         /// Time Machine style: hourly kept 24h, daily kept ~30d, weekly beyond.
         case automatic
-        /// Keep only the most recent N snapshots.
+        /// Keep only the most recent N restore points.
         case keepCount(Int)
-        /// Keep snapshots created within the last N days.
+        /// Keep restore points created within the last N days.
         case keepDays(Int)
         /// Never auto-delete; stop backing up (and warn) when the disk fills.
         case keepAll
@@ -31,7 +32,7 @@ struct RetentionPolicy: Codable, Sendable, Hashable {
     /// Low-water free-space mark in bytes that forces oldest-first deletion (0 = disabled).
     var minimumFreeBytes: Int64
     /// Maximum total bytes the backup may occupy (quota — e.g. a NAS share allowance); 0 = unlimited.
-    /// When exceeded, the oldest snapshots are deleted first.
+    /// When exceeded, the oldest restore points are deleted first.
     var maxTotalBytes: Int64
 
     init(mode: Mode, minimumFreeBytes: Int64 = 0, maxTotalBytes: Int64 = 0) {

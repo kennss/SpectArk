@@ -1,15 +1,18 @@
 //
 //  @file        DestinationCapabilities.swift
-//  @description Probed capabilities of a destination volume and the snapshot strategy they select.
-//               Established by DestinationProbe before the first backup to a destination.
+//  @description Probed capabilities of a destination volume and where the backup is written: directly on
+//               the volume, or inside an APFS sparsebundle on it. Established by DestinationProbe before
+//               each pass.
 //  @author      Kennt Kim
 //  @company     Calida Lab
 //  @created     2026-06-29
-//  @lastUpdated 2026-06-29
+//  @lastUpdated 2026-09-18
 //
 //  Notes:
-//  - Strategy selection is deliberately conservative: clone (local APFS) is preferred, then
-//    hardlink-tree only if hardlinks PERSIST across a remount, else the fragile sparsebundle path.
+//  - Direct only on a local volume with full file-system semantics — clonefile (APFS) or hard links that
+//    persist across a remount (HFS+). Everything else (SMB shares, exFAT/FAT drives) gets a sparsebundle:
+//    the history engine's SQLite catalog must not live on a network file system, and xattrs, BSD flags
+//    and permissions must survive (docs/INCREMENTAL_ENGINE_DESIGN.md §3.1).
 //  - `isCaseSensitive` matters for data safety: a case-insensitive destination can silently clobber
 //    two source names differing only in case — the probe flags it so the engine can refuse/rename.
 //
@@ -28,19 +31,15 @@ enum MTimeResolution: String, Codable, Sendable, Hashable {
     case second
 }
 
-/// Snapshot materialization strategy for a destination.
+/// Where a destination's backups are written.
 enum BackupStrategy: String, Codable, Sendable, Hashable {
-    /// APFS clonefile of the prior snapshot tree (local APFS). Default — Finder-browsable, ~O(1).
-    case clone
-    /// mkdir directories + hardlink unchanged files; fresh copy for changed (non-APFS / SMB w/ links).
-    case hardlinkTree
-    /// APFS sparsebundle image on a NAS supporting neither clone nor persistent hardlinks (last resort).
+    /// On the volume itself (local APFS or HFS+) — current/ is browsable in Finder.
+    case direct
+    /// Inside an APFS sparsebundle image on the volume (NAS shares, exFAT/FAT drives).
     case sparsebundle
 
-    /// Choose the safest viable strategy from probed capabilities.
     static func select(from caps: DestinationCapabilities) -> BackupStrategy {
-        if caps.supportsClone { return .clone }
-        if caps.supportsHardlink && caps.hardlinkPersistsRemount { return .hardlinkTree }
+        if caps.supportsClone || (caps.supportsHardlink && caps.hardlinkPersistsRemount) { return .direct }
         return .sparsebundle
     }
 }

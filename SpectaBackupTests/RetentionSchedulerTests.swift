@@ -1,13 +1,14 @@
 //
 //  @file        RetentionSchedulerTests.swift
-//  @description Unit tests for the pure retention planner and the interval scheduler: keepCount /
-//               keepDays / automatic thinning, quota (maxTotalBytes) and minimum-free-space pressure
-//               dropping the oldest first, the newest snapshot never being dropped, and schedule
-//               due/next-due math.
+//  @description Unit tests for the retention policies and the interval scheduler: keepCount / keepDays /
+//               automatic thinning, quota (maxTotalBytes) and minimum-free-space pressure dropping the
+//               oldest first, the newest restore point never being dropped (on a timeline of legacy
+//               snapshots — the same planner covers checkpoints, see HistoryRetentionTests), and
+//               schedule due/next-due math.
 //  @author      Kennt Kim
 //  @company     Calida Lab
 //  @created     2026-06-29
-//  @lastUpdated 2026-06-29
+//  @lastUpdated 2026-09-18
 //
 
 import XCTest
@@ -17,16 +18,14 @@ final class RetentionSchedulerTests: XCTestCase {
 
     private let now = Date(timeIntervalSince1970: 2_000_000_000)
 
-    private func snap(_ seq: Int64, ageSec: Double, blocks: Int64 = 0) -> SnapshotRecord {
-        SnapshotRecord(seqId: seq, jobID: UUID(),
-                       timestamp: now.addingTimeInterval(-ageSec),
-                       dirName: "d\(seq)", status: .complete,
-                       fileCount: 0, logicalBytes: 0, addedBlocks: blocks,
-                       durationMs: 0, sourceSnapshotID: nil)
+    /// A legacy snapshot whose own footprint is `blocks` 512-byte blocks.
+    private func snap(_ seq: Int64, ageSec: Double, blocks: Int64 = 0) -> HistoryRetention.LegacySnapshot {
+        .init(id: seq, time: now.addingTimeInterval(-ageSec), bytes: blocks * 512)
     }
 
-    private func plan(_ policy: RetentionPolicy, _ snaps: [SnapshotRecord], free: Int64) -> Set<Int64> {
-        Set(RetentionManager.plan(policy: policy, snapshots: snaps, freeBytes: free, now: now))
+    private func plan(_ policy: RetentionPolicy, _ snaps: [HistoryRetention.LegacySnapshot], free: Int64) -> Set<Int64> {
+        HistoryRetention.plan(policy: policy, checkpoints: [], versions: [], currentBytes: 0, legacy: snaps,
+                              freeBytes: free, now: now).legacySnapshots
     }
 
     // MARK: - Policy

@@ -7,7 +7,7 @@
 //  @author      Kennt Kim
 //  @company     Calida Lab
 //  @created     2026-06-30
-//  @lastUpdated 2026-06-30
+//  @lastUpdated 2026-09-18
 //
 
 import SwiftUI
@@ -85,7 +85,7 @@ private struct BackupDefaultsPane: View {
         var label: String {
             switch self {
             case .automatic: return "Automatic (Time Machine style)"
-            case .keepCount: return "Keep last N snapshots"
+            case .keepCount: return "Keep last N restore points"
             case .keepDays: return "Keep last N days"
             case .keepAll: return "Keep all"
             }
@@ -110,11 +110,11 @@ private struct BackupDefaultsPane: View {
                 Text("When to back up")
             } footer: {
                 Text(triggerBinding.wrappedValue
-                     ? "Realtime: SpectArk watches the folder and snapshots automatically whenever files change — not on a timer. New backups start with this trigger; you can change it per backup."
-                     : "Scheduled: snapshots run automatically on the interval you set, in the background. New backups start with this trigger; you can change it per backup.")
+                     ? "Realtime: SpectArk watches the folder and backs up each change within seconds, keeping a restore point at most every 15 minutes — not on a timer. New backups start with this trigger; you can change it per backup."
+                     : "Scheduled: a backup runs automatically on the interval you set, in the background, and each one is a restore point. New backups start with this trigger; you can change it per backup.")
             }
 
-            Section("Keep snapshots") {
+            Section("Keep restore points") {
                 Picker("Retention", selection: retentionBinding) {
                     ForEach(RetentionKind.allCases) { Text($0.label).tag($0) }
                 }

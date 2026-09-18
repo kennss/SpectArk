@@ -6,7 +6,7 @@
 //  @author      Kennt Kim
 //  @company     Calida Lab
 //  @created     2026-06-29
-//  @lastUpdated 2026-06-29
+//  @lastUpdated 2026-09-18
 //
 //  Notes:
 //  - clonefile is APFS-local CoW; `dst` MUST NOT pre-exist (EEXIST otherwise). CLONE_NOOWNERCOPY is
@@ -14,6 +14,8 @@
 //  - copyItem uses COPYFILE_ALL|COPYFILE_NOFOLLOW: full metadata (perms/ACL/xattr/stat/BSD flags) and
 //    copies symlinks as links, never following them. Source→destination is always a real byte copy.
 //  - Durability uses fcntl(F_FULLFSYNC) — plain fsync() does NOT flush the drive's write cache on macOS.
+//    `syncToDevice` is the cheap half (push a file or directory to the drive); batch writers call it per
+//    item and then issue ONE F_FULLFSYNC (e.g. an SQLite commit with fullfsync=ON) to flush the cache.
 //  - atomicRename relies on rename(2) being atomic within a single volume; it replaces an existing dst.
 //
 
@@ -59,6 +61,15 @@ enum Syscalls {
         if fcntl(fd, F_FULLFSYNC) == -1 {
             throw InfraError(operation: "F_FULLFSYNC", path: nil, code: errno)
         }
+    }
+
+    /// Push a file's (or directory's) data and metadata to the device with plain fsync — NOT through the
+    /// drive's cache. Pair it with one later F_FULLFSYNC per batch. Symlinks are synced as links.
+    static func syncToDevice(_ path: String) throws {
+        let fd = open(path, O_RDONLY | O_SYMLINK)
+        if fd == -1 { throw InfraError(operation: "open(sync)", path: path, code: errno) }
+        defer { close(fd) }
+        if fsync(fd) == -1 { throw InfraError(operation: "fsync", path: path, code: errno) }
     }
 
     /// fsync a directory (so a rename/create within it is durable). Opens read-only, fsyncs, closes.

@@ -3,10 +3,11 @@
 //  @description Guards backward compatibility of the persisted job config: a config.json written by
 //               an older build (before the retention `maxTotalBytes` quota field existed) must still
 //               decode, defaulting the missing field — otherwise the whole job list silently vanishes.
+//               Same for `skipsBuildArtifacts`, which must default to ON for existing jobs.
 //  @author      Kennt Kim
 //  @company     Calida Lab
 //  @created     2026-06-29
-//  @lastUpdated 2026-06-29
+//  @lastUpdated 2026-09-18
 //
 
 import XCTest
@@ -41,5 +42,15 @@ final class ConfigCompatTests: XCTestCase {
         XCTAssertEqual(jobs.count, 1)
         XCTAssertEqual(jobs.first?.name, "Developments")
         XCTAssertEqual(jobs.first?.retention.maxTotalBytes, 0)
+        XCTAssertEqual(jobs.first?.skipsBuildArtifacts, true)   // absent ⇒ artifact exclusion on
+    }
+
+    func testSkipsBuildArtifactsRoundTrips() throws {
+        var job = BackupJob(name: "x", sources: [URL(fileURLWithPath: "/tmp/src")],
+                            destination: URL(fileURLWithPath: "/tmp/dst"))
+        XCTAssertTrue(job.skipsBuildArtifacts)   // new jobs default on
+        job.skipsBuildArtifacts = false
+        let decoded = try JSONDecoder().decode(BackupJob.self, from: JSONEncoder().encode(job))
+        XCTAssertFalse(decoded.skipsBuildArtifacts)
     }
 }

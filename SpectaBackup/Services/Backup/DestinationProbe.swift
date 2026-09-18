@@ -2,12 +2,12 @@
 //  @file        DestinationProbe.swift
 //  @description Probes a destination volume's real capabilities by performing tiny live tests in a
 //               throwaway directory: clonefile support, hardlink support, xattr round-trip, case
-//               sensitivity, plus filesystem type and free space. The result selects the snapshot
-//               strategy (clone / hardlink-tree / sparsebundle).
+//               sensitivity, plus filesystem type and free space. The result selects where backups are
+//               written (directly, or inside a sparsebundle).
 //  @author      Kennt Kim
 //  @company     Calida Lab
 //  @created     2026-06-29
-//  @lastUpdated 2026-06-29
+//  @lastUpdated 2026-09-18
 //
 //  Notes:
 //  - Tests are real syscalls against the actual volume — never assume from the fs name alone.

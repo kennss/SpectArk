@@ -1,8 +1,9 @@
 # SpectArk — Roadmap / TODO
 
-The 1.x core is complete: realtime + scheduled backups, versioned snapshots
-(APFS clone / hardlink sharing), local + NAS destinations, optional encryption,
-restore, retention, resume of interrupted passes, a crash-safe integrity core,
+The core is complete: realtime + scheduled backups with the history engine (every change
+protected within seconds, a restore point at most every 15 minutes, Time Machine thinning —
+[`docs/INCREMENTAL_ENGINE_DESIGN.md`](docs/INCREMENTAL_ENGINE_DESIGN.md)), local + NAS
+destinations, optional encryption, restore, retention, crash recovery of interrupted passes,
 menu-bar metrics, in-app auto-update, and notarized distribution.
 
 Below is what's intentionally left for later, roughly in priority order. Nothing here
@@ -28,10 +29,15 @@ is a known bug — these are enhancements.
 
 ## P3 — Encrypted repo completeness
 
+- **Journal-driven passes and checkpoint cadence for encrypted jobs.** Plaintext jobs use the
+  history engine; encrypted jobs still walk the whole source and write a repo snapshot on every
+  pass (DedupEngine) — the O(tree)-per-change cost the history engine removed. Give them the same
+  FSEvents journal (compare only dirty folders against the parent snapshot's tree) and at most one
+  snapshot per 15 minutes (design §3.9).
 - **Partial (file-tree) restore** for encrypted jobs. Restore is currently all-or-nothing
   for encrypted repos; the plaintext path already has a file picker.
 - **Prune / GC retention** for the encrypted repo (reclaim unreferenced blobs/packs).
-  Retention thinning exists for plaintext snapshots but not for the dedup repo.
+  Retention thinning exists for plaintext backups but not for the dedup repo.
 - **Password change** for an encrypted repo (re-wrap the key slots).
 
 ## P3 — NAS completeness
@@ -43,16 +49,15 @@ is a known bug — these are enhancements.
   identity and resolve the live mount point at backup time (match via `getmntinfo`), so remounts
   never orphan a job. Until then, a moved destination shows the "not connected" card and must be
   re-pointed by hand.
-- **Sparsebundle history + restore.** The sparsebundle write path works; browsing history
-  and restoring from it still need the same attach/detach wrapper. Also call
-  `hdiutil compact` periodically so a deleted-from snapshot actually reclaims space.
+- **Sparsebundle history + restore.** NAS jobs back up with the history engine inside the image;
+  listing their timeline and restoring still need the image attached (read-only) while browsing — and
+  "Last backup" is unknown until the first pass after launch. Keeping the image attached while the app
+  runs (instead of attach/detach per pass) would serve both and save the per-pass attach cost. Also call
+  `hdiutil compact` periodically so pruned versions actually reclaim space.
 
 ## P4 — Robustness / nice-to-have
 
-- **Resume on caught errors too.** Resume covers quit / crash / kill / unplug / power loss.
-  A *caught* mid-pass error (e.g. a per-file permission failure) still discards the
-  partial and restarts next time. Keeping the partial on any error would make it truly
-  "resume from any interruption" (a partial has no COMPLETE marker, so it's safe to keep).
-- **Bit-rot scrub** — periodically re-hash stored snapshots to detect silent corruption.
+- **Bit-rot scrub** — periodically re-hash stored backups (current/ and versions/) to detect silent
+  corruption.
 - **Battery / sleep gating** — option to skip or defer passes on battery; resume on wake.
 - **NAS link-speed metric** — show throughput as a % of the NIC link speed for NAS jobs.

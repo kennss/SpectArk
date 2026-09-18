@@ -1,11 +1,12 @@
 //
 //  @file        JobRuntimeState.swift
 //  @description Per-job, UI-facing runtime state (not persisted): whether a pass is running, live
-//               progress, the last completed snapshot, the most recent error, and recent history.
+//               progress, when the job was last backed up, its restore points, the space its backups
+//               occupy, and the most recent error.
 //  @author      Kennt Kim
 //  @company     Calida Lab
 //  @created     2026-06-29
-//  @lastUpdated 2026-06-29
+//  @lastUpdated 2026-09-18
 //
 
 import Foundation
@@ -13,9 +14,13 @@ import Foundation
 struct JobRuntimeState: Sendable {
     var isRunning: Bool = false
     var progress: BackupProgress = BackupProgress()
-    var lastSnapshot: SnapshotRecord?
+    /// When a pass last brought the backup up to date; nil = never.
+    var lastBackup: Date?
     var lastError: String?
-    var history: [SnapshotRecord] = []
+    /// Restore points, newest first.
+    var restorePoints: [RestorePoint] = []
+    /// Bytes this job's backups occupy at the destination.
+    var storageBytes: Int64 = 0
     /// Smoothed write rate while a pass runs (bytes/sec); 0 when idle.
     var throughputBytesPerSec: Double = 0
     /// Free space at the destination volume (bytes); nil if unknown / unreachable.

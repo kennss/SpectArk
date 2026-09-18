@@ -5,12 +5,15 @@
 //  @author      Kennt Kim
 //  @company     Calida Lab
 //  @created     2026-06-29
-//  @lastUpdated 2026-06-29
+//  @lastUpdated 2026-09-18
 //
 //  Notes:
 //  - `sources`/`destination` are absolute file URLs. The app is non-sandboxed, so no security-scoped
 //    bookmarks are needed — paths are stored and used directly.
 //  - TriggerMode is a Codable enum with an associated IntervalSpec; Swift synthesizes the coding.
+//  - `skipsBuildArtifacts` defaults to true, including for jobs saved before the field existed:
+//    dependency folders and build outputs are rebuildable and made up 85–95% of the entries in real
+//    developer source trees (measured 2026-09-18).
 //
 
 import Foundation
@@ -56,6 +59,9 @@ struct BackupJob: Codable, Sendable, Identifiable, Hashable {
     var trigger: TriggerMode
     /// Relative glob patterns to exclude, in addition to the built-in excludes.
     var excludeGlobs: [String]
+    /// Skip rebuildable developer artifacts (dependency folders, build outputs, caches) — see
+    /// `ArtifactRules` for exactly what qualifies.
+    var skipsBuildArtifacts: Bool
     var retention: RetentionPolicy
     var isEnabled: Bool
     /// When true, this job backs up into an encrypted dedup repo (DedupEngine) instead of the
@@ -69,6 +75,7 @@ struct BackupJob: Codable, Sendable, Identifiable, Hashable {
          destination: URL,
          trigger: TriggerMode = .realtime,
          excludeGlobs: [String] = [],
+         skipsBuildArtifacts: Bool = true,
          retention: RetentionPolicy = .automatic,
          isEnabled: Bool = true,
          encryptionEnabled: Bool = false,
@@ -79,15 +86,18 @@ struct BackupJob: Codable, Sendable, Identifiable, Hashable {
         self.destination = destination
         self.trigger = trigger
         self.excludeGlobs = excludeGlobs
+        self.skipsBuildArtifacts = skipsBuildArtifacts
         self.retention = retention
         self.isEnabled = isEnabled
         self.encryptionEnabled = encryptionEnabled
         self.createdAt = createdAt
     }
 
-    // Backward-compatible decoding: `encryptionEnabled` is absent in repos created before encryption.
+    // Backward-compatible decoding: `encryptionEnabled` is absent in repos created before encryption,
+    // and `skipsBuildArtifacts` in configs saved before artifact exclusion existed.
     enum CodingKeys: String, CodingKey {
-        case id, name, sources, destination, trigger, excludeGlobs, retention, isEnabled, encryptionEnabled, createdAt
+        case id, name, sources, destination, trigger, excludeGlobs, skipsBuildArtifacts, retention, isEnabled,
+             encryptionEnabled, createdAt
     }
 
     init(from decoder: Decoder) throws {
@@ -98,6 +108,7 @@ struct BackupJob: Codable, Sendable, Identifiable, Hashable {
         destination = try c.decode(URL.self, forKey: .destination)
         trigger = try c.decode(TriggerMode.self, forKey: .trigger)
         excludeGlobs = try c.decode([String].self, forKey: .excludeGlobs)
+        skipsBuildArtifacts = try c.decodeIfPresent(Bool.self, forKey: .skipsBuildArtifacts) ?? true
         retention = try c.decode(RetentionPolicy.self, forKey: .retention)
         isEnabled = try c.decode(Bool.self, forKey: .isEnabled)
         encryptionEnabled = try c.decodeIfPresent(Bool.self, forKey: .encryptionEnabled) ?? false

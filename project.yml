@@ -6,7 +6,7 @@
 # @author      Kennt Kim
 # @company     Calida Lab
 # @created     2026-06-29
-# @lastUpdated 2026-07-05
+# @lastUpdated 2026-09-18
 
 name: SpectaBackup
 options:
@@ -20,8 +20,8 @@ settings:
   base:
     SWIFT_VERSION: "6.0"
     SWIFT_STRICT_CONCURRENCY: complete
-    MARKETING_VERSION: "1.1.4"
-    CURRENT_PROJECT_VERSION: "7"
+    MARKETING_VERSION: "1.2.0"
+    CURRENT_PROJECT_VERSION: "8"
     CODE_SIGN_STYLE: Automatic
     DEVELOPMENT_TEAM: "8677QL77VJ"
     ENABLE_HARDENED_RUNTIME: YES
