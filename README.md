@@ -7,13 +7,15 @@
 
 ![SpectArk](docs/hero.png)
 
-A native macOS incremental backup app (Calida Lab / Specta product family).
+Realtime, versioned backup for the folders you actually care about — a native macOS app
+(Calida Lab / Specta product family).
 
 ## Download
 
 **[⬇ Download the latest DMG](https://github.com/kennss/SpectArk/releases/latest)** — open it
 and drag **SpectArk** to Applications. Signed with a Developer ID and notarized by Apple;
-universal (Apple Silicon + Intel), macOS 14+.
+universal (Apple Silicon + Intel), macOS 14+. Once installed, SpectArk updates itself
+(**Check for Updates…**).
 
 See the [Releases page](https://github.com/kennss/SpectArk/releases) for release notes and
 previous versions.
@@ -30,17 +32,18 @@ it works wasn't what I needed:
   code; a short one still loses whatever changed in the last few minutes when Murphy's
   law strikes. Even Git only protects what I've committed — never the work *between*
   commits.
-- **So I wanted a backup that fires the instant my code changes.** Point SpectArk at
-  the folder I'm actively developing in and it snapshots the moment a file changes — no
-  schedule, no gap. That realtime behavior is the whole reason this app exists.
+- **So I wanted a backup that follows my code as it changes.** Point SpectArk at the
+  folder I'm actively developing in and every change is backed up within seconds — no
+  schedule, no gap — with a restore point at most every 15 minutes to go back to. That
+  realtime behavior is the whole reason this app exists.
 - **And I didn't want to sacrifice a whole drive to it.** Dedicating an entire disk to
-  backups felt wasteful. I wanted to choose exactly where snapshots live and pair any
+  backups felt wasteful. I wanted to choose exactly where backups live and pair any
   source folder with any destination, freely.
 - **The backup shouldn't become the leak.** A backup drive or NAS can be lost or
   stolen — and a plaintext copy hands over every file on it. So any backup can be
   encrypted end-to-end, unlocked only by your password (with a one-time recovery key as
-  a fallback). It's optional and off by default: when I don't need it, snapshots stay
-  browsable plaintext in Finder.
+  a fallback). It's optional and off by default: when I don't need it, backups stay
+  plain files I can open in Finder.
 
 SpectArk is the result: realtime, folder-scoped, versioned backup — optionally
 encrypted — that protects the files you actually care about, and lets you decide where
@@ -68,9 +71,35 @@ they go.
   quietly at login.
 - Non-sandboxed, Developer ID distribution. macOS 14+.
 
+## Getting started
+
+1. **Add a backup** with the **+** button: choose the folders to protect and a destination — a
+   folder on any disk, or a NAS share mounted in Finder. Pick **Realtime** (back up as files
+   change) or **Scheduled** (every so often), and turn on encryption if you want it: set a
+   password, and save the recovery key shown once.
+2. **Grant access when asked.** macOS asks the first time SpectArk reads your Desktop,
+   Documents or Downloads. To back up other protected places (another user's folders, a Photos
+   library…), turn SpectArk on in **System Settings ▸ Privacy & Security ▸ Full Disk Access**,
+   then quit and reopen SpectArk.
+3. **Open at login** (**Settings ▸ General**, or the prompt on a realtime backup): realtime backup
+   runs only while SpectArk is open. At login it starts quietly in the menu bar — no window, no
+   Dock icon.
+4. **Choose how long to keep history** in each backup's **⋯ ▸ Settings**: Automatic (Time Machine
+   style), keep the newest N, keep N days, or keep all — plus an optional maximum size, and how
+   much free space to keep on the backup disk (0 = automatic, 5% of the disk).
+
+## Restoring
+
+- **⋯ ▸ Restore…** (or right-click the backup): pick a restore point, tick the files and folders
+  you want back, and restore them to their original location or to another folder — choosing
+  what happens when a file already exists there. An encrypted backup restores a whole restore
+  point into a folder you choose.
+- **The latest backed-up state is a normal folder.** For a backup on a local disk, click the
+  destination card to open it in Finder and copy files straight out of it.
+
 ## Build
 
-The Xcode project is generated with [XcodeGen](https://github.com/yonki/XcodeGen):
+The Xcode project is generated with [XcodeGen](https://github.com/yonaskolb/XcodeGen):
 
 ```sh
 brew install xcodegen      # one-time
@@ -88,7 +117,8 @@ xcodebuild -project SpectaBackup.xcodeproj -scheme SpectaBackup -configuration R
 `SpectaBackup.xcodeproj` is generated and git-ignored; `project.yml` is the source of
 truth. The project and scheme keep the legacy `SpectaBackup` name (and the bundle id
 `ai.calidalab.spectabackup`) so existing backups, Keychain entries, and Full Disk
-Access carry over across the rename; the built app is `SpectArk.app`.
+Access carry over across the rename; the built app is `SpectArk.app`. A release (sign,
+notarize, DMG, Sparkle appcast) is built with `scripts/release.sh`.
 
 ## Data integrity
 
