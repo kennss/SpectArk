@@ -17,6 +17,8 @@ struct JobRuntimeState: Sendable {
     /// When a pass last brought the backup up to date; nil = never.
     var lastBackup: Date?
     var lastError: String?
+    /// Something the user should know although the last pass succeeded.
+    var lastWarning: String?
     /// Restore points, newest first.
     var restorePoints: [RestorePoint] = []
     /// Bytes this job's backups occupy at the destination.

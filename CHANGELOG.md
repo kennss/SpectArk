@@ -7,6 +7,16 @@ All notable changes to SpectArk are documented here. The format follows
 ## [Unreleased]
 
 ### Changed
+- **Encrypted backups work like the others now.** A pass reads only what changed — unchanged files are not
+  read again, and folders nothing changed in are not even listed (the same macOS file-system journal the
+  plain backups use) — so a realtime encrypted backup no longer re-reads the whole folder on every save.
+  Files still being written wait for a moment and are never recorded half-written; a pass that finds
+  nothing changed adds no restore point; and a restore point is kept at most every 15 minutes, plus every
+  state you left alone and every Back Up Now.
+- **Encrypted backups are thinned like the others.** The backup's retention policy (Automatic, keep N,
+  keep N days, a quota, a free-space floor) now applies to encrypted snapshots too, and the space only
+  the dropped ones used is given back — once a day, or right away when space is short. Before, an
+  encrypted backup kept every snapshot and only ever grew.
 - **A new backup engine: every change protected within seconds, a restore point at most every
   15 minutes.** SpectArk used to make a complete snapshot of the whole folder on every change, so saving
   one file cost as much as backing up everything (on a large developer folder: over 30 s of cloning per
@@ -39,6 +49,28 @@ All notable changes to SpectArk are documented here. The format follows
   day's restore point rather than two; it used to split days at midnight UTC.
 
 ### Fixed
+- **NAS backups give space back as old versions are thinned.** Deleting inside the backup image on the NAS
+  did not shrink it; now, once 1 GB or more has been freed in the image, it is compacted as it is put away
+  after a backup. What a compaction could not give back (free space scattered through the image) is
+  remembered, so the image is not compacted again — minutes of work over the network — until more has been
+  freed. New backup images may also grow to the size of the share (they used to be sized from the backup's
+  quota — wrongly, 512 times over).
+- **Restoring from an encrypted backup puts back each file's modification time**, as restoring from a plain
+  backup always did.
+- **Backups of folders that rarely change no longer rescan everything.** A backup looks up what changed
+  in the macOS file-system journal since its last pass; for a folder that seldom changes, that lookup
+  covered everything the whole disk did since the folder's last change, and on a busy disk it ran out of
+  time and fell back to comparing every file (over 30 s for a 75,000-file folder). The journal position
+  now moves on with every pass, and while a backup sits idle SpectArk keeps it current in the background.
+- **Encrypted backups keep no catalog at the destination any more.** Their restore points are read from
+  the encrypted repo itself (a small local cache shows them without the password); on a NAS the catalog
+  used to be a SQLite database on the network share, which SQLite does not support safely. Repo writes
+  now reach the disk before the snapshot that refers to them, so a crash never leaves a snapshot
+  pointing at data that was not written.
+- **A file changed while it was being backed up is no longer recorded half-written.** Every copy is now
+  checked against its source; if the file changed while it was copied, that copy is dropped, the
+  previous backup of it stays, and it is backed up again moments later once it has settled. A file that
+  never stops changing (a busy log) is still backed up, and copied again as soon as it pauses.
 - **A file locked in Finder no longer stops a backup**, and restoring it puts the lock back. Restoring
   over a locked file works, and a restore that fails leaves the existing file exactly as it was.
 - **Turning on encryption after an interrupted attempt removes all of the plaintext.** Restore points the

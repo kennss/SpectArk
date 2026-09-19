@@ -1,12 +1,13 @@
 //
 //  @file        SparsebundleTests.swift
 //  @description Integration test for SparsebundleManager: create an APFS sparsebundle on a simulated
-//               destination, attach it, confirm the inside is APFS (written directly), write/read a
-//               file, detach, and confirm the image persists while the mount point is gone.
+//               destination (at the size asked for), attach it, confirm the inside is APFS (written
+//               directly), write/read a file, detach, and confirm the image persists while the mount point
+//               is gone.
 //  @author      Kennt Kim
 //  @company     Calida Lab
 //  @created     2026-06-29
-//  @lastUpdated 2026-09-18
+//  @lastUpdated 2026-09-19
 //
 //  Uses real hdiutil; the image's own volume is APFS, so backups inside it are written directly.
 //
@@ -32,9 +33,13 @@ final class SparsebundleTests: XCTestCase {
         let dest = tmp.appendingPathComponent("nas-sim", isDirectory: true)
         try FileManager.default.createDirectory(at: dest, withIntermediateDirectories: true)
 
-        let attachment = try SparsebundleManager.attach(at: dest, maxSizeBytes: 200 * 1024 * 1024, readOnly: false)
+        let attachment = try SparsebundleManager.attach(at: dest, capacity: 1 << 30, readOnly: false)
         var detached = false
         defer { if !detached { SparsebundleManager.detach(attachment) } }
+
+        // Sized as asked — hdiutil's "b" is a 512-byte sector, and bytes given as sectors made it 512 times larger.
+        let info = try XCTUnwrap(NSDictionary(contentsOf: dest.appendingPathComponent("\(SparsebundleManager.imageName)/Info.plist")))
+        XCTAssertEqual((info["size"] as? NSNumber)?.int64Value, 1 << 30)
 
         // Mounted, and inside the image it's APFS → written directly.
         XCTAssertTrue(FileManager.default.fileExists(atPath: attachment.mountPoint.path))

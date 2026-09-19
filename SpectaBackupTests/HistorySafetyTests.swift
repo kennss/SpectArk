@@ -8,8 +8,9 @@
 //               untouched; the schema upgrade keeps the live row of a ghost pair; the reaper reports what it
 //               is about to free; this process's leftover NAS lock does not block its next attach; the
 //               05:00 day boundary follows the wall clock across daylight saving; a migration never
-//               discards history it could not read; a published tree whose row failed is adopted; and a
-//               migration request is not left behind.
+//               discards history it could not read; a published tree whose row failed is adopted; a
+//               migration request is not left behind; and a copy whose source changed while it was copied
+//               is never recorded, while a file that never stops changing is still backed up.
 //  @author      Kennt Kim
 //  @company     Calida Lab
 //  @created     2026-09-19
@@ -175,6 +176,56 @@ final class HistorySafetyTests: XCTestCase {
         XCTAssertEqual(kept.born, 3, "an upsert keeps the rowid: the live row can be the older one")
     }
 
+    // MARK: - Torn copies
+
+    /// An engine that changes `rel` in the source each time it has just copied it — a writer mid-copy.
+    private func engineWriting(_ rel: String, _ text: @escaping @Sendable () -> String) -> CaptureEngine {
+        let url = fixture.source.appendingPathComponent(rel)
+        return CaptureEngine(layout: fixture.layout) { step, path in
+            guard step == .copying, path == "src/" + rel else { return }
+            try Data(text().utf8).write(to: url)
+        }
+    }
+
+    /// `rel` last modified long ago: out of any quiet window.
+    private func age(_ rel: String) throws {
+        try FileManager.default.setAttributes([.modificationDate: Date().addingTimeInterval(-3600)],
+                                              ofItemAtPath: fixture.source.appendingPathComponent(rel).path)
+    }
+
+    func testACopyWhoseSourceChangedWhileItWasCopiedIsNeverRecorded() throws {
+        try fixture.write("a.txt", "one")
+        try age("a.txt")
+        try fixture.pass(at: 0, quietWindow: 3)
+        try fixture.write("a.txt", "two---")
+        try age("a.txt")
+        let changes = FSEventsGetCurrentEventId()
+        let outcome = try fixture.pass(at: 1, engine: engineWriting("a.txt") { "three!!!" }, quietWindow: 3)
+        XCTAssertEqual(outcome.deferredCount, 1, "deferred like a file in its quiet window")
+        XCTAssertEqual(fixture.mirror("a.txt"), "one", "the old copy stays")
+        XCTAssertEqual(try fixture.store().entry(at: "src/a.txt")?.size, 3)
+
+        fixture.note("a.txt", after: changes)
+        try fixture.pass(at: 1.1)   // the settle pass
+        XCTAssertEqual(fixture.mirror("a.txt"), "three!!!")
+        XCTAssertEqual(try fixture.store().entry(at: "src/a.txt")?.size, 8, "what was copied is what is recorded")
+        try fixture.assertConsistent()
+    }
+
+    func testAFileThatNeverStopsChangingIsStillBackedUpAndCopiedAgainOnceItStops() throws {
+        try fixture.write("log.txt", "0")
+        let writes = WriteCounter()
+        let changes = FSEventsGetCurrentEventId()
+        let outcome = try fixture.pass(at: 0, engine: engineWriting("log.txt") { "\(writes.next())-changed" })
+        XCTAssertEqual(outcome.deferredCount, 0, "a settle pass keeps its last copy")
+        XCTAssertEqual(fixture.mirror("log.txt"), "2-changed", "as of just before that copy")
+
+        fixture.note("log.txt", after: changes)
+        try fixture.pass(at: 1)   // it stopped changing: seen as changed, copied again
+        XCTAssertEqual(fixture.mirror("log.txt"), "3-changed")
+        try fixture.assertConsistent()
+    }
+
     // MARK: - Reaper, NAS lock, day boundary
 
     func testTheReaperReportsWhatItIsAboutToFree() {
@@ -198,7 +249,7 @@ final class HistorySafetyTests: XCTestCase {
         let owner = try XCTUnwrap(SparsebundleManager.currentLockOwner())
         try JSONEncoder().encode(owner).write(to: destination.appendingPathComponent(SparsebundleManager.lockName))
         do {
-            let attachment = try SparsebundleManager.attach(at: destination, maxSizeBytes: 0, readOnly: false)
+            let attachment = try SparsebundleManager.attach(at: destination, readOnly: false)
             SparsebundleManager.detach(attachment)
         } catch SparsebundleManager.SBError.locked {
             XCTFail("a lock none of this process's attachments holds is not live")
@@ -279,5 +330,18 @@ final class HistorySafetyTests: XCTestCase {
         _ = s.migrationFinished(now: Date())
         s.workStarted(.pass(quietWindow: 0, requested: true))
         XCTAssertNotEqual(s.passFinished(now: Date(), duration: 1, deferredCount: 0, succeeded: true), .startMigration)
+    }
+}
+
+/// Numbers the writes a test makes from the engine's thread.
+private final class WriteCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+
+    func next() -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        count += 1
+        return count
     }
 }

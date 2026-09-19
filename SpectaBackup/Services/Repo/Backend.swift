@@ -8,7 +8,7 @@
 //  @author      Kennt Kim
 //  @company     Calida Lab
 //  @created     2026-06-30
-//  @lastUpdated 2026-06-30
+//  @lastUpdated 2026-09-19
 //
 
 import Foundation
@@ -37,4 +37,7 @@ protocol Backend: Sendable {
     func stat(key: String) async throws -> BackendStat?
     func list(prefix: String) async throws -> [String]
     func delete(key: String) async throws
+    /// Make every object put so far durable (a write barrier): what is written after it — a snapshot, the
+    /// commit point — can never survive a crash without what it refers to.
+    func sync() async throws
 }

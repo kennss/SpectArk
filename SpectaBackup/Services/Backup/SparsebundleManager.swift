@@ -65,12 +65,13 @@ struct SparsebundleManager: Sendable {
     static let removingPrefix = ".deleting-"
 
     /// Ensure the image exists (create if missing, read-write only) and attach it; returns the mount.
-    static func attach(at destination: URL, maxSizeBytes: Int64, readOnly: Bool) throws -> Attachment {
+    /// `capacity`: the size a new image may grow to (bytes) — by default the share's own (see `create`).
+    static func attach(at destination: URL, capacity: Int64? = nil, readOnly: Bool) throws -> Attachment {
         let image = destination.appendingPathComponent(imageName, isDirectory: true)
 
         if !(try Syscalls.exists(image.path)) {
             guard !readOnly else { throw SBError.missingImage }
-            try create(image: image, maxSizeBytes: maxSizeBytes)
+            try create(image: image, capacity: capacity)
         }
 
         // Single-writer lock (read-write only). Best-effort: prevents same-host double-attach and
@@ -176,29 +177,46 @@ struct SparsebundleManager: Sendable {
         case remove
     }
 
+    /// What `detach(_:reclaim:)` did.
+    enum ReclaimResult: Equatable, Sendable {
+        /// The detach was refused: nothing done, the lock kept, the image still attached.
+        case refused
+        /// Detached, and the reclaim ran.
+        case reclaimed
+        /// Detached; the reclaim did not run through, and the image is as it was (why, for the log).
+        case failed(String)
+    }
+
     /// Detach, then compact or remove the image — still holding its writer lock, so no other Mac attaches
-    /// it meanwhile. Deleting inside an image frees nothing on the share until this runs. Returns false,
-    /// with nothing done and the lock kept, when the detach was refused. A failed compaction changes
-    /// nothing; a removal renames the image away first, and what a failed deletion leaves is removed by
-    /// `sweepRemovedImages`.
+    /// it meanwhile. Deleting inside an image frees nothing on the share until this runs. A failed
+    /// compaction changes nothing; a removal renames the image away first, and what a failed deletion
+    /// leaves is removed by `sweepRemovedImages`.
     @discardableResult
-    static func detach(_ attachment: Attachment, reclaim: Reclaim) -> Bool {
+    static func detach(_ attachment: Attachment, reclaim: Reclaim) -> ReclaimResult {
         // A removal was decided on what the attached volume held: only that volume, still here, backs it.
         let wasAttached = isAttached(attachment)
-        guard detachVolume(attachment) else { return false }
+        guard detachVolume(attachment) else { return .refused }
         attachments.remove(attachment)
         defer { if let lock = attachment.lockURL { release(lock) } }
         switch reclaim {
         case .compact:
-            _ = try? run(["compact", attachment.imageURL.path, "-batteryallowed"])
+            do {
+                try run(["compact", attachment.imageURL.path, "-batteryallowed"])
+            } catch {
+                return .failed("\(error)")
+            }
         case .remove:
-            guard wasAttached else { break }
+            guard wasAttached else { return .failed("the volume was ejected before it was detached") }
             let removing = attachment.imageURL.deletingLastPathComponent()
                 .appendingPathComponent(removingPrefix + imageName + "-" + UUID().uuidString, isDirectory: true)
-            guard (try? Syscalls.atomicRename(attachment.imageURL.path, to: removing.path)) != nil else { break }
+            do {
+                try Syscalls.atomicRename(attachment.imageURL.path, to: removing.path)
+            } catch {
+                return .failed("\(error)")
+            }
             try? FileManager.default.removeItem(at: removing)
         }
-        return true
+        return .reclaimed
     }
 
     /// Images a removal left behind at `destination` (renamed away, not fully deleted): deleted in the
@@ -212,12 +230,15 @@ struct SparsebundleManager: Sendable {
 
     // MARK: - hdiutil
 
-    private static func create(image: URL, maxSizeBytes: Int64) throws {
-        // Sparse: -size is the MAX logical capacity; actual disk use grows only with real data.
-        // Use the quota if set, otherwise a generous 2 TB cap.
-        let size = maxSizeBytes > 0 ? "\(maxSizeBytes)b" : "2t"
-        _ = try run(["create", "-type", "SPARSEBUNDLE", "-fs", "APFS",
-                     "-volname", "SpectaBackup", "-size", size, "-nospotlight", image.path])
+    /// A new image, sized to grow as far as the share it is on (`capacity` overrides): sparse, it takes only
+    /// what it holds. Not the job's quota — retention keeps that, and an image exactly that full would fail
+    /// a pass that briefly holds more before its retention runs. hdiutil's "b" size unit is a 512-byte
+    /// sector (an image sized in "bytes" with it came out 512 times larger — measured).
+    private static func create(image: URL, capacity: Int64?) throws {
+        let share = try? Syscalls.volumeInfo(at: image.deletingLastPathComponent().path).totalBytes
+        let bytes = max(capacity ?? share ?? (2 << 40), 1 << 30)
+        _ = try run(["create", "-type", "SPARSEBUNDLE", "-fs", "APFS", "-volname", "SpectaBackup",
+                     "-size", "\(bytes / 512)b", "-nospotlight", image.path])
     }
 
     private static func attachImage(_ image: URL, readOnly: Bool) throws -> URL {

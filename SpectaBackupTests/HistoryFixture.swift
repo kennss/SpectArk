@@ -31,7 +31,8 @@ final class HistoryFixture {
     let layout: HistoryLayout
     let t0 = Date(timeIntervalSinceReferenceDate: 800_000_000)
     private let watch: JournalWatch
-    private let canonicalSource: String
+    /// The source folder as realpath(3) spells it (FSEvents reports paths this way).
+    let canonicalSource: String
     private var unsettled: [(path: String, after: UInt64)] = []
 
     init() throws {
@@ -88,6 +89,12 @@ final class HistoryFixture {
     /// Wait for `rel` too before the next pass (for changes made without the helpers above).
     func note(_ rel: String, after: UInt64) {
         unsettled.append((canonicalSource + "/" + rel, after))
+    }
+
+    /// Wait until FSEvents has reported every change made through the helpers (for passes run elsewhere).
+    func waitForEvents() {
+        XCTAssertTrue(watch.waitFor(unsettled), "FSEvents never reported \(unsettled.map(\.path))")
+        unsettled.removeAll()
     }
 
     @discardableResult

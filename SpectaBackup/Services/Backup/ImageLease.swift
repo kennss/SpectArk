@@ -2,8 +2,10 @@
 //  @file        ImageLease.swift
 //  @description Keeps a destination's sparsebundle (a NAS job's backups) attached while anything uses
 //               it — a pass, the timeline, a restore, an open restore sheet — and detaches it once nothing
-//               has for a little while. Also gives the image's free space back to the share when asked.
-//               One lease per image, shared by everything in the process.
+//               has for a little while. Also gives the image's free space back to the share — when asked,
+//               and as it is detached idle once enough is to be had (CompactionLedger keeps what each
+//               image's compactions showed, across launches). One lease per image, shared by everything
+//               in the process.
 //  @author      Kennt Kim
 //  @company     Calida Lab
 //  @created     2026-09-19
@@ -31,12 +33,29 @@
 //  - `peek` looks inside without claiming the image (identifying a destination): read-only, no lock.
 //  - Sleep detaches idle images, skipping any lease busy attaching or compacting (the main thread never
 //    waits on it); quitting detaches everything (SparsebundleManager.detachAll, from AppDelegate).
+//  - Compaction: space retention frees inside an image stays allocated on the share until the image is
+//    compacted (measured). When the idle timer detaches an image, what the share holds for it (band files ×
+//    band size) is compared with what its volume uses (ATTR_VOL_SPACEUSED, measured while still attached):
+//    the gap. Compaction gives back only bands left wholly free, so part of the gap is the image's own —
+//    its structures, and free space scattered through bands still in use (measured on a 105 GB NAS image:
+//    1.2 GB of gap, 72 MB given back, 3 minutes over SMB). The gap a compaction leaves is the baseline, and
+//    the next compaction waits for the gap to grow `compactionThreshold` past it; the baseline follows the
+//    gap down as later writes fill the scattered space. APFS gives freed blocks back to the image only as
+//    later transactions process its free queue — at once in a small container, over later writes in a large
+//    one (measured: 100 MB freed in a 100 GB image reclaimed 4 MB at once, all of it after a minute of
+//    further writes) — so a compaction that left a gap past the threshold is followed up a day later; a
+//    follow-up that gives back less than the threshold settles the baseline. All this is kept across
+//    launches (CompactionLedger), or every launch would compact again what cannot be given back. Compaction
+//    runs under the writer lock; sleep and quit never compact.
 //
 
 import Darwin
 import Foundation
+import os
 
 final class ImageLease: @unchecked Sendable {
+
+    private static let log = Logger(subsystem: "ai.calidalab.spectabackup", category: "image")
 
     /// The image a destination's NAS backups live in.
     static func imageURL(for destination: URL) -> URL {
@@ -71,6 +90,12 @@ final class ImageLease: @unchecked Sendable {
 
     let destination: URL
     private let idleTimeout: TimeInterval
+    /// Bytes the gap must grow past its baseline before an idle image is compacted as it is detached.
+    private let compactionThreshold: Int64
+    /// What is known of this image's compactions, across launches.
+    let ledger: CompactionLedger
+    /// A compaction that left a gap is followed up this much later (APFS will have released more by then).
+    static let compactionFollowUpInterval: TimeInterval = 86_400
     private let lock = NSLock()
     /// Where reclaims run (tests wait for it with `drain`).
     private let queue = DispatchQueue(label: "ai.calidalab.spectabackup.image-lease", qos: .utility)
@@ -80,9 +105,12 @@ final class ImageLease: @unchecked Sendable {
     private var generation = 0
     private var reclaimWanted = false
 
-    init(destination: URL, idleTimeout: TimeInterval = 30) {
+    init(destination: URL, idleTimeout: TimeInterval = 30, compactionThreshold: Int64 = 1 << 30,
+         ledger: CompactionLedger = .shared) {
         self.destination = destination
         self.idleTimeout = idleTimeout
+        self.compactionThreshold = compactionThreshold
+        self.ledger = ledger
     }
 
     /// The image exists at the destination. Throws when the share cannot tell (it stopped answering).
@@ -90,14 +118,14 @@ final class ImageLease: @unchecked Sendable {
         try Syscalls.exists(Self.imageURL(for: destination).path)
     }
 
-    /// Hold the image attached and return its mount point. `create`: make the image (sized for
-    /// `maxSizeBytes`, 0 = the default cap) when there is none — only a pass does. Pair every successful
-    /// call with `release`.
-    func acquire(maxSizeBytes: Int64 = 0, create: Bool) throws -> URL {
+    /// Hold the image attached and return its mount point. `create`: make the image when there is none —
+    /// only a pass does (`capacity`: its size, by default the share's). Pair every successful call with
+    /// `release`.
+    func acquire(capacity: Int64? = nil, create: Bool) throws -> URL {
         lock.lock()
         defer { lock.unlock() }
         generation += 1
-        let mount = try attachedLocked(create: create, maxSizeBytes: maxSizeBytes)
+        let mount = try attachedLocked(create: create, capacity: capacity)
         users += 1
         return mount
     }
@@ -136,7 +164,7 @@ final class ImageLease: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         guard armed == nil || armed == generation else { return }
-        detachLocked()
+        detachLocked(mayCompact: armed != nil)   // only the idle timer takes the time to compact
     }
 
     /// Look inside the image without claiming it: through the attachment when one is held, else attached
@@ -147,7 +175,7 @@ final class ImageLease: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         if let current = attachment, SparsebundleManager.isAttached(current) { return body(current.mountPoint) }
-        guard let look = try? SparsebundleManager.attach(at: destination, maxSizeBytes: 0, readOnly: true) else { return nil }
+        guard let look = try? SparsebundleManager.attach(at: destination, readOnly: true) else { return nil }
         defer { SparsebundleManager.detach(look) }
         return body(look.mountPoint)
     }
@@ -167,7 +195,7 @@ final class ImageLease: @unchecked Sendable {
     // MARK: - Under the lock
 
     /// The live attachment, attaching (or attaching again) when there is none.
-    private func attachedLocked(create: Bool, maxSizeBytes: Int64) throws -> URL {
+    private func attachedLocked(create: Bool, capacity: Int64? = nil) throws -> URL {
         if let current = attachment, !SparsebundleManager.isAttached(current) {
             SparsebundleManager.forget(current)   // ejected: only its lock is released, no hdiutil
             attachment = nil
@@ -175,14 +203,113 @@ final class ImageLease: @unchecked Sendable {
         if let attachment { return attachment.mountPoint }
         SparsebundleManager.sweepRemovedImages(at: destination)
         guard try create || imageExists() else { throw SparsebundleManager.SBError.missingImage }
-        let attached = try SparsebundleManager.attach(at: destination, maxSizeBytes: maxSizeBytes, readOnly: false)
+        let attached = try SparsebundleManager.attach(at: destination, capacity: capacity, readOnly: false)
         attachment = attached
         return attached.mountPoint
     }
 
-    private func detachLocked() {
-        guard users == 0, let current = attachment, SparsebundleManager.detach(current) else { return }
+    private func detachLocked(mayCompact: Bool = false) {
+        guard users == 0, let current = attachment else { return }
+        if mayCompact, let used = Self.usedBytes(of: current), let held = Self.heldBytes(of: current.imageURL) {
+            let record = ledger.record(for: current.volumeID)
+            if let trigger = Self.compactionTrigger(gap: held - used, record: record,
+                                                    threshold: compactionThreshold, now: Date()) {
+                compactLocked(current, held: held, used: used, trigger: trigger)
+                return
+            }
+            if let lowered = Self.lowered(record, toGap: held - used) {
+                ledger.set(lowered, for: current.volumeID)
+            }
+        }
+        guard SparsebundleManager.detach(current) else { return }
         attachment = nil
+    }
+
+    /// Detach the image and compact it, and note what that gave back. False: the detach was refused (the
+    /// image is still attached). `held`, `used`: measured just before, while attached; nil when they could
+    /// not be — then nothing is noted, and the idle timer measures afresh next time.
+    @discardableResult
+    private func compactLocked(_ current: SparsebundleManager.Attachment, held: Int64?, used: Int64?,
+                               trigger: CompactionTrigger) -> Bool {
+        let started = Date()
+        let result = SparsebundleManager.detach(current, reclaim: .compact)
+        guard result != .refused else { return false }
+        attachment = nil
+        guard let held, let used else { return true }
+        let after = result == .reclaimed ? (Self.heldBytes(of: current.imageURL) ?? held) : held
+        let left = max(0, after - used), given = max(0, held - after)
+        let record = Self.record(afterCompacting: trigger, previous: ledger.record(for: current.volumeID),
+                                 left: left, given: given, succeeded: result == .reclaimed,
+                                 threshold: compactionThreshold, now: Date())
+        ledger.set(record, for: current.volumeID)
+        let seconds = Int(Date().timeIntervalSince(started).rounded())
+        let next = record.followUp == nil ? "" : "; looked at again in a day"
+        if case let .failed(why) = result {
+            Self.log.error("compacting the image at \(self.destination.path, privacy: .public) failed after \(seconds) s: \(why, privacy: .public)\(next, privacy: .public)")
+        } else {
+            Self.log.notice("compacted the image at \(self.destination.path, privacy: .public) (\(trigger.rawValue, privacy: .public)): \(given >> 20) MB of \((held - used) >> 20) MB held beyond use given back in \(seconds) s\(next, privacy: .public)")
+        }
+        return true
+    }
+
+    // MARK: - Compaction policy
+
+    /// Why an idle image is compacted.
+    enum CompactionTrigger: String, Sendable {
+        /// The gap grew past its baseline by the threshold: something was freed since.
+        case grown
+        /// A compaction that left a gap is looked at again.
+        case followUp
+    }
+
+    /// Whether an image whose share holds `gap` bytes beyond its volume's use is compacted now.
+    static func compactionTrigger(gap: Int64, record: CompactionRecord?, threshold: Int64,
+                                  now: Date) -> CompactionTrigger? {
+        guard gap >= threshold else { return nil }
+        if gap >= (record?.baseline ?? 0) + threshold { return .grown }
+        if let due = record?.followUp, now >= due { return .followUp }
+        return nil
+    }
+
+    /// What is known of an image once it was compacted: `left` bytes still held beyond use, `given` back.
+    /// A failed compaction is no verdict: tried again a day later. One that left a gap past the threshold
+    /// may have run before APFS released what was freed: looked at again a day later — unless it was that
+    /// look again, and it gave back less than the threshold, so what is left is the image's own.
+    static func record(afterCompacting trigger: CompactionTrigger, previous: CompactionRecord?, left: Int64,
+                       given: Int64, succeeded: Bool, threshold: Int64, now: Date) -> CompactionRecord {
+        let again = !succeeded || (left >= threshold && (trigger == .grown || given >= threshold))
+        return CompactionRecord(baseline: left, compacted: succeeded ? now : previous?.compacted,
+                                followUp: again ? now.addingTimeInterval(compactionFollowUpInterval) : nil)
+    }
+
+    /// The record with its baseline brought down to a smaller gap (later writes filled scattered free space),
+    /// so growth is measured from the least the gap has been; nil when nothing changes.
+    static func lowered(_ record: CompactionRecord?, toGap gap: Int64) -> CompactionRecord? {
+        guard var record, gap < record.baseline else { return nil }
+        record.baseline = max(0, gap)
+        return record
+    }
+
+    /// Bytes the attached image's volume holds (ATTR_VOL_SPACEUSED — what `diskutil` calls its capacity in
+    /// use). Not statfs: a sparse image's free space is capped by the share's, so its "used" is meaningless
+    /// (measured: 1 TB for an empty image), and freeing space inside does not show there.
+    private static func usedBytes(of attachment: SparsebundleManager.Attachment) -> Int64? {
+        guard SparsebundleManager.isAttached(attachment) else { return nil }
+        var request = attrlist()
+        request.bitmapcount = u_short(ATTR_BIT_MAP_COUNT)
+        request.volattr = attrgroup_t(ATTR_VOL_INFO) | attrgroup_t(ATTR_VOL_SPACEUSED)
+        var buffer = [UInt8](repeating: 0, count: 32)   // u_int32 length, then the off_t — packed, unaligned
+        guard getattrlist(attachment.mountPoint.path, &request, &buffer, buffer.count, 0) == 0 else { return nil }
+        return buffer.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: MemoryLayout<UInt32>.size, as: Int64.self) }
+    }
+
+    /// Bytes the share holds for the image: its band files, each allocated whole (band size, Info.plist).
+    private static func heldBytes(of image: URL) -> Int64? {
+        guard let info = NSDictionary(contentsOf: image.appendingPathComponent("Info.plist")),
+              let bandSize = (info["band-size"] as? NSNumber)?.int64Value,
+              let bands = try? FileManager.default.contentsOfDirectory(atPath: image.appendingPathComponent("bands").path)
+        else { return nil }
+        return Int64(bands.filter { !$0.hasPrefix(".") }.count) * bandSize
     }
 
     private func armIdleDetachLocked() {
@@ -200,8 +327,9 @@ final class ImageLease: @unchecked Sendable {
         guard users == 0, reclaimWanted else { return }
         // Attached (again, after a sleep) so the writer lock is ours while the image is judged and
         // reclaimed: another Mac may have added a job to it meanwhile.
-        guard let mount = try? attachedLocked(create: false, maxSizeBytes: 0), let current = attachment else { return }
+        guard let mount = try? attachedLocked(create: false), let current = attachment else { return }
         let verdict = Self.holdsNoBackups(mount)
+        let used = Self.usedBytes(of: current), held = Self.heldBytes(of: current.imageURL)
         // Ejected while it was read: what was read is no verdict on the image (an empty listing may be
         // another volume's, or none at all).
         guard SparsebundleManager.isAttached(current) else {
@@ -209,8 +337,17 @@ final class ImageLease: @unchecked Sendable {
             attachment = nil
             return
         }
-        if SparsebundleManager.detach(current, reclaim: verdict == true ? .remove : .compact) {
-            attachment = nil
+        let detached: Bool
+        if verdict == true {
+            let result = SparsebundleManager.detach(current, reclaim: .remove)
+            detached = result != .refused
+            if detached { attachment = nil }
+            if result == .reclaimed { ledger.forget(current.volumeID) }
+        } else {
+            // A job's backups were removed: freed, as the idle timer's own growth trigger means.
+            detached = compactLocked(current, held: held, used: used, trigger: .grown)
+        }
+        if detached {
             reclaimWanted = false
         } else {
             armIdleDetachLocked()   // refused: still attached, so it is detached as idle later
@@ -231,5 +368,84 @@ final class ImageLease: @unchecked Sendable {
             }
             if !name.hasPrefix(".") { return false }
         }
+    }
+}
+
+/// What the idle timer knows of one image's compactions.
+struct CompactionRecord: Codable, Equatable, Sendable {
+    /// Bytes the share held beyond the volume's use after the last compaction — the image's own, as far as
+    /// is known — brought down as the gap shrinks (`ImageLease.lowered`).
+    var baseline: Int64
+    /// When a compaction last ran through.
+    var compacted: Date?
+    /// A follow-up compaction is due from then.
+    var followUp: Date?
+}
+
+/// Compaction records kept across launches, keyed by the image's volume UUID — a new image in the same place
+/// starts afresh, and an image removed takes its record with it. One JSON file; every lease shares it.
+final class CompactionLedger: @unchecked Sendable {
+
+    static let shared = CompactionLedger(file: defaultFile)
+
+    /// Application Support in the app, a scratch file in a unit-test host.
+    static let defaultFile: URL = {
+        if AppRuntime.isUnitTestHost {
+            return URL(fileURLWithPath: NSTemporaryDirectory())
+                .appendingPathComponent("SpectArkTests-ImageCompaction-\(ProcessInfo.processInfo.processIdentifier).json")
+        }
+        return FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("SpectaBackup/ImageCompaction.json")
+    }()
+
+    let file: URL
+    private let lock = NSLock()
+
+    init(file: URL) {
+        self.file = file
+    }
+
+    func record(for volumeID: String) -> CompactionRecord? {
+        lock.lock()
+        defer { lock.unlock() }
+        return load()[volumeID]
+    }
+
+    func set(_ record: CompactionRecord, for volumeID: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        var records = load()
+        records[volumeID] = record
+        save(records)
+    }
+
+    func forget(_ volumeID: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        var records = load()
+        guard records.removeValue(forKey: volumeID) != nil else { return }
+        save(records)
+    }
+
+    /// Every record (tests).
+    func all() -> [String: CompactionRecord] {
+        lock.lock()
+        defer { lock.unlock() }
+        return load()
+    }
+
+    /// Unreadable or absent: nothing known, so the next idle detach measures afresh — at worst one
+    /// compaction more.
+    private func load() -> [String: CompactionRecord] {
+        guard let data = try? Data(contentsOf: file) else { return [:] }
+        return (try? JSONDecoder().decode([String: CompactionRecord].self, from: data)) ?? [:]
+    }
+
+    private func save(_ records: [String: CompactionRecord]) {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        guard let data = try? encoder.encode(records) else { return }
+        try? FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try? data.write(to: file, options: .atomic)
     }
 }

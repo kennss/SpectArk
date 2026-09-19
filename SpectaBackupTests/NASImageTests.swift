@@ -5,7 +5,9 @@
 //               is detached once idle; an image macOS ejected behind the lease is attached again; removing a
 //               job's backups gives the space back (the image goes with the last job) — once nothing uses the
 //               image, and never by ejecting another volume at its old path; turning encryption on moves a NAS
-//               job's plaintext out of the image and stops on a catalog it cannot read.
+//               job's plaintext out of the image and stops on a catalog it cannot read; an idle image whose
+//               share holds much more than its volume uses is compacted as it is detached, what that gave
+//               back is kept across launches, and a little churn since does not compact it again.
 //  @author      Kennt Kim
 //  @company     Calida Lab
 //  @created     2026-09-19
@@ -185,7 +187,7 @@ final class NASImageTests: XCTestCase {
         // Another image named alike takes the path that is free again.
         let other = root.appendingPathComponent("other", isDirectory: true)
         try FileManager.default.createDirectory(at: other, withIntermediateDirectories: true)
-        let otherAttachment = try SparsebundleManager.attach(at: other, maxSizeBytes: 0, readOnly: false)
+        let otherAttachment = try SparsebundleManager.attach(at: other, readOnly: false)
         defer { SparsebundleManager.detach(otherAttachment) }
         guard otherAttachment.mountPoint == first else {
             throw XCTSkip("macOS mounted the other image at \(otherAttachment.mountPoint.path)")
@@ -254,5 +256,53 @@ final class NASImageTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: imagePath))
         let history = try await runner.history(for: job)
         XCTAssertTrue(history.points.contains { $0.source == .checkpoint(seq: 1) }, "the plaintext is still there")
+    }
+
+    // MARK: - Compaction
+
+    private func bandCount(_ share: URL) throws -> Int {
+        try FileManager.default.contentsOfDirectory(atPath: ImageLease.imageURL(for: share).appendingPathComponent("bands").path)
+            .filter { !$0.hasPrefix(".") }.count
+    }
+
+    /// Write `bytes` into the image, then delete them: space its volume frees but the share keeps.
+    private func churn(_ lease: ImageLease, bytes: Int) throws {
+        let mount = try lease.acquire(create: false)
+        let file = mount.appendingPathComponent("churn.bin")
+        var data = Data(count: bytes)
+        _ = data.withUnsafeMutableBytes { SecRandomCopyBytes(kSecRandomDefault, bytes, $0.baseAddress!) }   // incompressible
+        try data.write(to: file)
+        try FileManager.default.removeItem(at: file)
+        lease.release(flush: true)
+    }
+
+    func testAnIdleImageHoldingMuchMoreThanItUsesIsCompactedAsItIsDetached() async throws {
+        // A small image: APFS releases freed blocks to it at once (a large one does over later writes).
+        let share = root.appendingPathComponent("small-share", isDirectory: true)
+        try FileManager.default.createDirectory(at: share, withIntermediateDirectories: true)
+        let ledgerFile = root.appendingPathComponent("compaction.json")
+        let lease = ImageLease(destination: share, idleTimeout: 0.3, compactionThreshold: 40 << 20,
+                               ledger: CompactionLedger(file: ledgerFile))
+        defer { lease.detachIfIdle() }
+        _ = try lease.acquire(capacity: 2 << 30, create: true)
+        lease.release(flush: false)
+        let before = try bandCount(share)
+        try churn(lease, bytes: 100 << 20)
+        let grown = try bandCount(share)
+        XCTAssertGreaterThan(grown, before + 8, "the share keeps what the volume freed")
+
+        try await Task.sleep(for: .seconds(3))   // the idle timer detaches it
+        XCTAssertFalse(lease.isHeld)
+        XCTAssertLessThan(try bandCount(share), grown - 8, "given back to the share")
+        let record = try XCTUnwrap(CompactionLedger(file: ledgerFile).all().values.first, "kept across launches")
+        XCTAssertNotNil(record.compacted)
+        XCTAssertLessThan(record.baseline, 40 << 20)
+        XCTAssertNil(record.followUp, "all of it given back: nothing to look at again")
+
+        // A little churn since: not worth another compaction.
+        try churn(lease, bytes: 2 << 20)
+        try await Task.sleep(for: .seconds(3))
+        XCTAssertFalse(lease.isHeld)
+        XCTAssertEqual(lease.ledger.all().values.first?.compacted, record.compacted)
     }
 }

@@ -12,25 +12,25 @@ is a known bug — these are enhancements.
 
 ## P2 — Deepest data integrity
 
-- **Source APFS local snapshot for consistent reads** (torn-file prevention).
-  Reading a file while it's being written can capture a half-written version. The
-  fully-correct fix is to snapshot the source volume (`fs_snapshot_*`) and read from the
-  frozen view. That call needs root, so it requires a privileged helper (`SMAppService`
+- **Source APFS local snapshot for consistent reads.** A single file is no longer recorded torn
+  (every copy is checked against its source and dropped if the source moved while it was copied),
+  but files that must agree with each other — a SQLite database and its `-wal`, a Git operation in
+  progress — are still copied one after another, not at one instant. The fully-correct fix is to
+  snapshot the source volume (`fs_snapshot_*`) and read from the frozen view. That call needs root, so it requires a privileged helper (`SMAppService`
   daemon). The engine already abstracts this behind `SourceReadSession` (currently a
   coordinated read + quiet-window), so swapping in a real snapshot session later is not a
   rewrite.
 
 ## P3 — Encrypted repo completeness
 
-- **Journal-driven passes and checkpoint cadence for encrypted jobs.** Plaintext jobs use the
-  history engine; encrypted jobs still walk the whole source and write a repo snapshot on every
-  pass (DedupEngine) — the O(tree)-per-change cost the history engine removed. Give them the same
-  FSEvents journal (compare only dirty folders against the parent snapshot's tree) and at most one
-  snapshot per 15 minutes (design §3.9).
+The repo is the encrypted job's only record (RepoTimeline; no catalog at the destination). Left:
+
+- **Remove a damaged encrypted restore point.** A snapshot object that cannot be decrypted (bit rot,
+  tampering) is left alone — never deleted on its own, since it may only be unreadable for now — and while
+  it is kept, garbage collection and the space rules stop (the job shows a warning). Offer the user a way to
+  remove it (after a re-read confirms the damage), so a quota or free-space rule works again.
 - **Partial (file-tree) restore** for encrypted jobs. Restore is currently all-or-nothing
   for encrypted repos; the plaintext path already has a file picker.
-- **Prune / GC retention** for the encrypted repo (reclaim unreferenced blobs/packs).
-  Retention thinning exists for plaintext backups but not for the dedup repo.
 - **Password change** for an encrypted repo (re-wrap the key slots).
 
 ## P3 — NAS completeness
@@ -43,14 +43,13 @@ is a known bug — these are enhancements.
   sharing one destination folder share one image, so an open restore window on one Mac (it holds the
   image, and so the lock) keeps the others' passes waiting; one image per Mac, as Time Machine does,
   would remove that contention altogether.
-- **Compact NAS images after retention.** APFS inside a sparsebundle returns no bands to the share
-  on its own (measured: deleting 300 MB inside an image left it at 325 MB until `hdiutil compact`,
-  which took it to 21 MB). Removing a job's backups or migrating them to the encrypted repo already
-  compacts (or removes) the image (`SparsebundleManager.detach(_:reclaim:)`); versions retention drops
-  inside the image are not given back yet. Track what retention freed in the image and compact when the
-  lease detaches an idle image after enough was freed — under the writer lock, like the other reclaims.
 
 ## P4 — Robustness / nice-to-have
+
+- **Plaintext retention when the disk is full.** A capture pass that fails for lack of space (ENOSPC) leaves
+  intents behind, and maintenance waits while intents are pending; recovery runs only at the start of the
+  next pass, which fails the same way. Free space before capturing when the destination is short (seal and
+  thin first, or recover then run retention), as encrypted jobs now do after a failed pass.
 
 - **Bit-rot scrub** — periodically re-hash stored backups (current/ and versions/) to detect silent
   corruption.

@@ -2,15 +2,17 @@
 //  @file        DedupEngineTests.swift
 //  @description End-to-end tests for the encrypted dedup engine: back up a source tree (files,
 //               subdirectory, multi-chunk large file, symlink) then restore it in a fresh engine and
-//               compare bytes/structure; and verify an unchanged re-backup reuses content-addressed
-//               trees (no new tree objects).
+//               compare bytes/structure; verify an unchanged re-backup reuses content-addressed
+//               trees (no new tree objects); and that a restored file gets its modification time back to
+//               the nanosecond, a time before 1970 included, and its permissions.
 //  @author      Kennt Kim
 //  @company     Calida Lab
 //  @created     2026-06-30
-//  @lastUpdated 2026-09-18
+//  @lastUpdated 2026-09-19
 //
 
 import XCTest
+import Darwin
 @testable import SpectaBackup
 
 final class DedupEngineTests: XCTestCase {
@@ -52,7 +54,7 @@ final class DedupEngineTests: XCTestCase {
 
         let writer = try makeEngine(repo)
         let snapshot = try await writer.backUp(sources: [src], snapshotID: "s1", now: 1000, exclusions: .includeEverything,
-                                   toleratingVanishedEntries: false)
+                                   toleratingVanishedEntries: false).snapshot
         XCTAssertEqual(snapshot.fileCount, 2)
 
         let dst = tmp.appendingPathComponent("dst")
@@ -77,7 +79,7 @@ final class DedupEngineTests: XCTestCase {
 
         let snapshot = try await makeEngine(repo).backUp(sources: [src], snapshotID: "s1", now: 1000,
                                                          exclusions: BackupExclusions(skipsBuildArtifacts: true),
-                                                         toleratingVanishedEntries: true)
+                                                         toleratingVanishedEntries: true).snapshot
         XCTAssertEqual(snapshot.fileCount, 2, "same two files as without the excluded entries")
 
         let dst = tmp.appendingPathComponent("dst")
@@ -127,5 +129,44 @@ final class DedupEngineTests: XCTestCase {
 
         XCTAssertEqual(packsAfterFirst, packsAfterSecond,
                        "a new session must dedup identical data — no new packs should be written")
+    }
+
+    // MARK: - Metadata
+
+    private func stat(_ path: String) -> Darwin.stat {
+        var st = Darwin.stat()
+        lstat(path, &st)
+        return st
+    }
+
+    private func setModified(_ path: String, seconds: Int, nanoseconds: Int) {
+        var times = [timespec(tv_sec: 0, tv_nsec: Int(UTIME_OMIT)), timespec(tv_sec: seconds, tv_nsec: nanoseconds)]
+        utimensat(AT_FDCWD, path, &times, AT_SYMLINK_NOFOLLOW)
+    }
+
+    func testARestoredFileGetsItsModificationTimeAndPermissionsBack() async throws {
+        let src = tmp.appendingPathComponent("src")
+        try FileManager.default.createDirectory(at: src, withIntermediateDirectories: true)
+        let recent = src.appendingPathComponent("recent.txt").path
+        let ancient = src.appendingPathComponent("ancient.txt").path
+        try Data("recent".utf8).write(to: URL(fileURLWithPath: recent))
+        try Data("ancient".utf8).write(to: URL(fileURLWithPath: ancient))
+        setModified(recent, seconds: 1_600_000_000, nanoseconds: 123_456_789)
+        setModified(ancient, seconds: -86_400, nanoseconds: 500_000_000)   // 1969-12-31
+        chmod(recent, 0o640)
+
+        let repo = tmp.appendingPathComponent("repo")
+        try await makeEngine(repo).backUp(sources: [src], snapshotID: "s1", now: 1000, exclusions: .includeEverything,
+                                          toleratingVanishedEntries: false)
+        let dst = tmp.appendingPathComponent("dst")
+        try await makeEngine(repo).restore(snapshotID: "s1", to: dst)
+
+        let restoredRecent = stat(dst.appendingPathComponent("src/recent.txt").path)
+        XCTAssertEqual(restoredRecent.st_mtimespec.tv_sec, 1_600_000_000)
+        XCTAssertEqual(restoredRecent.st_mtimespec.tv_nsec, 123_456_789, "to the nanosecond")
+        XCTAssertEqual(restoredRecent.st_mode & 0o7777, 0o640)
+        let restoredAncient = stat(dst.appendingPathComponent("src/ancient.txt").path)
+        XCTAssertEqual(restoredAncient.st_mtimespec.tv_sec, -86_400)
+        XCTAssertEqual(restoredAncient.st_mtimespec.tv_nsec, 500_000_000)
     }
 }

@@ -16,7 +16,8 @@
 //    the source folder is no longer the verified directory (inode), after a settings or rules change,
 //    when events were lost, and once a day. Why a source is walked in full is logged (subsystem
 //    ai.calidalab.spectabackup, category history): a full walk of a large source is slow, and the reason
-//    is otherwise gone once the pass has moved the cursor on.
+//    is otherwise gone once the pass has moved the cursor on. So is a replay that starts from a journal hint
+//    (how far past the stored cursor).
 //  - The journal only says where to look. A reported directory is compared as itself only if its path
 //    reaches it without a symlink and in the letter case on disk (realpath), it is not excluded, and this
 //    pass is not removing it; otherwise its parent's listing decides. A directory is compared whole when
@@ -28,7 +29,14 @@
 //    batches: log intents (commit) → filesystem steps with plain fsync → sync touched directories →
 //    resolve (commit = F_FULLFSYNC). A catalog row never points at data not yet on stable storage.
 //  - Put = copy the source to a temp beside the target, fsync it, retire the old item (move it to
-//    versions/ if a checkpoint contains it, else unlink it), rename the temp over the target. The copy
+//    versions/ if a checkpoint contains it, else unlink it), rename the temp over the target.
+//  - A copy is checked against the source (type, size, mtime, ctime, inode just before and just after it):
+//    one whose source moved — since the plan judged it settled, or while it was copied — may be torn, so
+//    it is dropped, the old copy stays, and the file is deferred like one still in its quiet window (the
+//    settle pass follows). A settle pass (no quiet window) copies again, up to `settleCopyAttempts`, then
+//    keeps the last copy — a file written without pause must still be backed up — recorded as of just
+//    before that copy, so the next pass sees the change and copies it again. What is recorded is what was
+//    copied: the stamp from just before the copy, not the plan's. The copy
 //    drops the source's lock flags (UF_IMMUTABLE/UF_APPEND forbid those renames); the catalog records
 //    them and restore puts them back.
 //  - Recovery decides each leftover intent from the disk: temp present? target still the old inode?
@@ -62,6 +70,8 @@ struct CaptureOutcome: Sendable {
     let comparedDirectories: Int
     /// When the pass finished: current/ matched the source as of this moment.
     let finishedAt: Date
+    /// The journal cursors the pass stored, per source name (none for a source without a journal).
+    var journalCursors: [String: JournalCursor] = [:]
 }
 
 enum CaptureError: Error, CustomStringConvertible {
@@ -83,10 +93,14 @@ struct CaptureEngine: Sendable {
     /// Intents logged and resolved per commit.
     static let batchSize = 500
 
-    /// Filesystem steps of one intent, for the crash-recovery tests.
+    /// Filesystem steps of one intent, for the crash-recovery tests. `copying`: a copy is done and its
+    /// source not yet looked at again — where a writer changing the source mid-copy is simulated.
     enum Step: Sendable {
-        case logged, copied, oldRetired, renamed
+        case logged, copying, copied, oldRetired, renamed
     }
+
+    /// Copies of a file that keeps changing, in a settle pass, before the last one is kept as it is.
+    static let settleCopyAttempts = 3
 
     let layout: HistoryLayout
     var faultHook: (@Sendable (Step, String) throws -> Void)?
@@ -98,10 +112,12 @@ struct CaptureEngine: Sendable {
 
     // MARK: - Pass
 
-    /// Run one capture pass. `forceCheckpoint` (Back Up Now) seals regardless of spacing.
+    /// Run one capture pass. `forceCheckpoint` (Back Up Now) seals regardless of spacing. `journalHints`:
+    /// per source name, a later cursor a replay may start from (JournalCursor.advanced).
     func runPass(job: BackupJob,
                  quietWindow: TimeInterval,
                  forceCheckpoint: Bool,
+                 journalHints: [String: JournalHint] = [:],
                  now: () -> Date = { Date() },
                  progress: (BackupProgress) -> Void = { _ in }) throws -> CaptureOutcome {
         let fm = FileManager.default
@@ -124,27 +140,28 @@ struct CaptureEngine: Sendable {
         }
 
         let start = now()
-        let scope = try discover(job: job, store: store, now: start)
+        let scope = try discover(job: job, store: store, hints: journalHints, now: start)
         let plan = try makePlan(job: job, scope: scope, store: store, quietWindow: quietWindow)
         var stats = ApplyStats()
         for batch in stride(from: 0, to: plan.operations.count, by: Self.batchSize).map({
             Array(plan.operations[$0..<min($0 + Self.batchSize, plan.operations.count)])
         }) {
-            try apply(batch, store: store, stats: &stats, progress: progress)
+            try apply(batch, store: store, settling: quietWindow == 0, stats: &stats, progress: progress)
         }
 
         let end = now()
-        try store.finishPass(end: end, cursors: scope.cursors, carried: Array(plan.carried).sorted {
+        try store.finishPass(end: end, cursors: scope.cursors, carried: Array(plan.carried.union(stats.carried)).sorted {
             ($0.source, $0.path) < ($1.source, $1.path)
         }, fingerprint: scope.fingerprint, fullScanAt: scope.everySourceFullyScanned ? start : nil,
            verifiedDirectories: plan.verifiedDirectories)
         if try store.hasUnsealedChanges(), try forceCheckpoint || spacingElapsed(store, at: end) {
             sealed.append(try store.seal(at: end))
         }
-        return CaptureOutcome(changedCount: stats.changed, deferredCount: plan.deferredCount,
+        return CaptureOutcome(changedCount: stats.changed, deferredCount: plan.deferredCount + stats.deferred,
                               bytesCopied: stats.bytesCopied, sealed: sealed, recoveredIntents: recovered,
                               fullScan: !scope.fullyScannedSources.isEmpty,
-                              comparedDirectories: plan.comparedDirectories, finishedAt: end)
+                              comparedDirectories: plan.comparedDirectories, finishedAt: end,
+                              journalCursors: scope.cursors.compactMapValues { $0 })
     }
 
     private func spacingElapsed(_ store: HistoryStore, at time: Date) throws -> Bool {
@@ -185,7 +202,8 @@ struct CaptureEngine: Sendable {
             + job.excludeGlobs.map { "glob=" + $0 }).joined(separator: "\n")
     }
 
-    private func discover(job: BackupJob, store: HistoryStore, now: Date) throws -> Scope {
+    private func discover(job: BackupJob, store: HistoryStore, hints: [String: JournalHint],
+                          now: Date) throws -> Scope {
         let fingerprint = Self.fingerprint(of: job)
         let settingsChanged = try store.settingsFingerprint() != fingerprint
         let safetyDue = try store.lastFullScan().map { now.timeIntervalSince($0) >= Self.safetyScanInterval } ?? true
@@ -196,7 +214,11 @@ struct CaptureEngine: Sendable {
         for source in job.sources {
             let name = source.lastPathComponent
             let cursorAtStart = ChangeJournal.cursorNow(for: source)   // before anything is read
-            let stored = try store.journalCursor(for: name)
+            let recorded = try store.journalCursor(for: name)
+            let stored = recorded?.advanced(to: hints[name])
+            if let recorded, let stored, stored != recorded {
+                Self.log.notice("journal replay of \(name, privacy: .public) starts from a quiet check, \(stored.eventID - recorded.eventID) events past the stored cursor")
+            }
             let changes: JournalChanges
             if settingsChanged {
                 changes = .fullScan(reason: "settings or built-in rules changed")
@@ -463,9 +485,13 @@ struct CaptureEngine: Sendable {
         var changed = 0
         var bytesCopied: Int64 = 0
         var processed = 0
+        /// Files whose copy was dropped as possibly torn, and the folders to compare again for them.
+        var deferred = 0
+        var carried = Set<HistoryStore.CarriedDirectory>()
     }
 
-    private func apply(_ batch: [Operation], store: HistoryStore, stats: inout ApplyStats,
+    /// `settling`: a pass without a quiet window (a settle pass, Back Up Now) — see copyVerified.
+    private func apply(_ batch: [Operation], store: HistoryStore, settling: Bool, stats: inout ApplyStats,
                        progress: (BackupProgress) -> Void) throws {
         let drafts = batch.map { op -> HistoryStore.IntentDraft in
             switch op {
@@ -493,10 +519,11 @@ struct CaptureEngine: Sendable {
                 try createDirectoryIfNeeded(target)
                 resolutions.append(.applied(intentID: intent.id, path: intent.path,
                                             entry: try newEntry(intent, at: target), retired: nil))
-            case let .put(_, source, kind, size, _, _, _):
+            case let .put(_, source, kind, _, _, _, _):
                 let temp = layout.temp(for: intent.path, intentID: intent.id)
+                let copied: SourceStamp?
                 do {
-                    try Syscalls.copyItem(at: source, to: temp)
+                    copied = try copyVerified(source, to: temp, intent: intent, settling: settling)
                 } catch _ where FileWalker.vanished(source) {
                     // Deleted since the plan: the path is simply gone now.
                     try? FileManager.default.removeItem(atPath: temp)
@@ -510,6 +537,14 @@ struct CaptureEngine: Sendable {
                     stats.changed += 1
                     continue
                 }
+                guard let copied else {
+                    // Possibly torn: dropped; the old copy stays until the file settles.
+                    try? FileManager.default.removeItem(atPath: temp)
+                    resolutions.append(.rollback(intentID: intent.id))
+                    stats.deferred += 1
+                    stats.carried.insert(Self.carriedDirectory(of: intent.path))
+                    continue
+                }
                 try Syscalls.unlock(temp)
                 if kind != .symlink { try Syscalls.syncToDevice(temp) }
                 try fault(.copied, intent.path)
@@ -520,9 +555,9 @@ struct CaptureEngine: Sendable {
                 try fault(.renamed, intent.path)
                 if kind == .symlink { mirror.reset() }
                 resolutions.append(.applied(intentID: intent.id, path: intent.path,
-                                            entry: try newEntry(intent, at: target),
+                                            entry: try newEntry(intent, at: target, copied: copied),
                                             retired: retiredIfKept(intent, lockFlags: lock)))
-                stats.bytesCopied += size
+                stats.bytesCopied += copied.size
             case .remove:
                 var lock: UInt32 = 0
                 if intent.old?.kind == .directory {
@@ -574,12 +609,75 @@ struct CaptureEngine: Sendable {
                               stored: old.kind == .directory ? nil : intent.storedName)
     }
 
-    private func newEntry(_ intent: HistoryIntent, at target: String) throws -> HistoryEntry {
+    /// The catalog row of an item just put in place. `copied`: the stamp of what was copied; without it
+    /// (recovery after a crash) the plan's size and mtime are recorded — if the file changed since, the next
+    /// pass sees the difference and copies it again.
+    private func newEntry(_ intent: HistoryIntent, at target: String, copied: SourceStamp? = nil) throws -> HistoryEntry {
         var st = Darwin.stat()
         guard lstat(target, &st) == 0 else { throw InfraError(operation: "lstat", path: target, code: errno) }
-        return HistoryEntry(path: intent.path, kind: intent.newKind, size: intent.newSize,
-                            mtimeNs: intent.newMtimeNs, born: intent.generation, mirrorIno: UInt64(st.st_ino),
-                            lockFlags: intent.newLockFlags)
+        return HistoryEntry(path: intent.path, kind: intent.newKind, size: copied?.size ?? intent.newSize,
+                            mtimeNs: copied?.mtimeNs ?? intent.newMtimeNs, born: intent.generation,
+                            mirrorIno: UInt64(st.st_ino), lockFlags: intent.newLockFlags)
+    }
+
+    // MARK: - Verified copy
+
+    /// What a copy is judged by. A source whose stamp moves while it is copied may have been copied torn.
+    private struct SourceStamp: Equatable {
+        let type: mode_t
+        let size: Int64
+        let mtimeNs: Int64
+        let ctimeNs: Int64
+        let ino: UInt64
+        let dev: Int32
+
+        init?(path: String) {
+            var st = Darwin.stat()
+            guard lstat(path, &st) == 0 else { return nil }
+            type = st.st_mode & S_IFMT
+            size = Int64(st.st_size)
+            mtimeNs = Int64(st.st_mtimespec.tv_sec) * 1_000_000_000 + Int64(st.st_mtimespec.tv_nsec)
+            ctimeNs = Int64(st.st_ctimespec.tv_sec) * 1_000_000_000 + Int64(st.st_ctimespec.tv_nsec)
+            ino = UInt64(st.st_ino)
+            dev = st.st_dev
+        }
+
+        func isKind(_ kind: HistoryItemKind) -> Bool {
+            switch kind {
+            case .file: return type == S_IFREG
+            case .symlink: return type == S_IFLNK
+            case .directory: return type == S_IFDIR
+            }
+        }
+    }
+
+    /// Copy `source` to `temp` and return the stamp of what was copied, or nil when the copy may be torn
+    /// (see the file notes). Throws, with the source gone, when it vanished.
+    private func copyVerified(_ source: String, to temp: String, intent: HistoryIntent,
+                              settling: Bool) throws -> SourceStamp? {
+        for attempt in 1...Self.settleCopyAttempts {
+            guard let before = SourceStamp(path: source) else {
+                throw InfraError(operation: "lstat", path: source, code: errno)
+            }
+            // Something else is at the path now: the next pass plans it anew.
+            guard before.isKind(intent.newKind) else { return nil }
+            // Changed since the plan judged it settled: not judged again here.
+            if !settling, before.size != intent.newSize || before.mtimeNs != intent.newMtimeNs { return nil }
+            try Syscalls.copyItem(at: source, to: temp)
+            try fault(.copying, intent.path)
+            if SourceStamp(path: source) == before { return before }
+            guard settling else { return nil }
+            if attempt == Self.settleCopyAttempts { return before }   // kept as it is, recorded as of before
+            try? FileManager.default.removeItem(atPath: temp)
+        }
+        return nil
+    }
+
+    /// The folder to compare again for a deferred item: its parent, as the plan records one (source, path).
+    private static func carriedDirectory(of path: String) -> HistoryStore.CarriedDirectory {
+        let parts = path.split(separator: "/", maxSplits: 1).map(String.init)
+        let rel = parts.count > 1 ? parts[1] : ""
+        return .init(source: parts[0], path: (rel as NSString).deletingLastPathComponent)
     }
 
     private func fault(_ step: Step, _ path: String) throws {

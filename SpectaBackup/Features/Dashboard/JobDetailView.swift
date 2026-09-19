@@ -32,6 +32,7 @@ struct JobDetailView: View {
                 else if job.encryptionEnabled, plaintextCount > 0 { migrationPrompt }
                 if state.lastError != nil, !destinationOnline { destinationOfflineCard }
                 else if let error = state.lastError { errorBanner(error) }
+                else if let warning = state.lastWarning { warningBanner(warning) }
                 statusCards
                 storageSection
                 snapshotsSection
@@ -326,6 +327,15 @@ struct JobDetailView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(12)
             .background(Color.wpRed.opacity(0.12), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+    }
+
+    private func warningBanner(_ message: String) -> some View {
+        Label(message, systemImage: "exclamationmark.circle.fill")
+            .font(.callout)
+            .foregroundStyle(.primary)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(12)
+            .background(Color.wpDesignYellow.opacity(0.14), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
     }
 
     private var lastBackupText: String {

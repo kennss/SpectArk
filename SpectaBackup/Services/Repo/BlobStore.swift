@@ -5,10 +5,12 @@
 //               overhead, and records blobID→(pack,offset,len) in an encrypted per-pack index object
 //               (index/<aa>/<id>). put() deduplicates against the in-memory index; get() does a Range
 //               read of just the blob's slice and verifies it. The index is rebuildable from packs.
+//               PackFormat writes and reads packs and their index objects — for BlobStore, and for the
+//               garbage collector's repacking (RepoMaintenance).
 //  @author      Kennt Kim
 //  @company     Calida Lab
 //  @created     2026-06-30
-//  @lastUpdated 2026-06-30
+//  @lastUpdated 2026-09-19
 //
 
 import Foundation
@@ -19,10 +21,52 @@ enum BlobStoreError: Error, CustomStringConvertible {
 }
 
 /// One blob's location inside a pack.
-private struct PackEntry: Codable, Sendable {
+struct PackEntry: Codable, Sendable, Equatable {
     let blobID: Data
     let offset: Int
     let length: Int
+}
+
+/// Packs and their index objects as the repo stores them: `data/<aa>/<id>` holds the ciphertexts back to
+/// back, `index/<aa>/<id>` the encrypted list of its entries.
+enum PackFormat {
+
+    /// One pack as its index object describes it.
+    struct IndexedPack: Sendable {
+        let packID: String      // "data/<aa>/<id>"
+        let indexKey: String    // "index/<aa>/<id>"
+        let entries: [PackEntry]
+    }
+
+    /// Write `blobs` as one new pack, then its index object. Returns what was written.
+    static func write(_ blobs: [(blobID: Data, ciphertext: Data)], backend: Backend,
+                      cipher: BlobCipher) async throws -> IndexedPack {
+        let id = UUID().uuidString.lowercased()
+        let shard = String(id.prefix(2))
+        let packID = "data/\(shard)/\(id)"
+        var packData = Data()
+        var entries: [PackEntry] = []
+        for (blobID, ciphertext) in blobs {
+            entries.append(PackEntry(blobID: blobID, offset: packData.count, length: ciphertext.count))
+            packData.append(ciphertext)
+        }
+        try await backend.put(key: packID, data: packData)
+        let indexKey = "index/\(shard)/\(id)"
+        try await backend.put(key: indexKey, data: try cipher.sealMetadata(try JSONEncoder().encode(entries), context: packID))
+        return IndexedPack(packID: packID, indexKey: indexKey, entries: entries)
+    }
+
+    /// Every pack the repo's index objects describe.
+    static func readIndex(backend: Backend, cipher: BlobCipher) async throws -> [IndexedPack] {
+        var packs: [IndexedPack] = []
+        for key in try await backend.list(prefix: "index") {
+            let packID = "data/" + String(key.dropFirst("index/".count))    // "<aa>/<id>"
+            let plaintext = try cipher.openMetadata(try await backend.get(key: key), context: packID)
+            packs.append(IndexedPack(packID: packID, indexKey: key,
+                                     entries: try JSONDecoder().decode([PackEntry].self, from: plaintext)))
+        }
+        return packs
+    }
 }
 
 actor BlobStore {
@@ -48,13 +92,9 @@ actor BlobStore {
 
     /// Rebuild the in-memory index from committed per-pack index objects.
     func loadIndex() async throws {
-        for key in try await backend.list(prefix: "index") {
-            let suffix = String(key.dropFirst("index/".count))    // "<aa>/<id>"
-            let packID = "data/\(suffix)"
-            let sealed = try await backend.get(key: key)
-            let plaintext = try cipher.openMetadata(sealed, context: packID)
-            for entry in try JSONDecoder().decode([PackEntry].self, from: plaintext) {
-                index[entry.blobID] = Location(packID: packID, offset: entry.offset, length: entry.length)
+        for pack in try await PackFormat.readIndex(backend: backend, cipher: cipher) {
+            for entry in pack.entries {
+                index[entry.blobID] = Location(packID: pack.packID, offset: entry.offset, length: entry.length)
             }
         }
     }
@@ -102,25 +142,9 @@ actor BlobStore {
     /// Write the pending buffer as one pack + its encrypted index object, then commit to the index.
     func flush() async throws {
         guard !pending.isEmpty else { return }
-        let id = UUID().uuidString.lowercased()
-        let shard = String(id.prefix(2))
-        let packID = "data/\(shard)/\(id)"
-
-        var packData = Data()
-        var entries: [PackEntry] = []
-        var offset = 0
-        for (blobID, ciphertext) in pending {
-            packData.append(ciphertext)
-            entries.append(PackEntry(blobID: blobID, offset: offset, length: ciphertext.count))
-            offset += ciphertext.count
-        }
-
-        try await backend.put(key: packID, data: packData)
-        let indexBlob = try cipher.sealMetadata(try JSONEncoder().encode(entries), context: packID)
-        try await backend.put(key: "index/\(shard)/\(id)", data: indexBlob)
-
-        for entry in entries {
-            index[entry.blobID] = Location(packID: packID, offset: entry.offset, length: entry.length)
+        let pack = try await PackFormat.write(pending, backend: backend, cipher: cipher)
+        for entry in pack.entries {
+            index[entry.blobID] = Location(packID: pack.packID, offset: entry.offset, length: entry.length)
         }
         pending.removeAll()
         pendingIDs.removeAll()

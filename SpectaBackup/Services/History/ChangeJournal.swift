@@ -8,7 +8,7 @@
 //  @author      Kennt Kim
 //  @company     Calida Lab
 //  @created     2026-09-18
-//  @lastUpdated 2026-09-18
+//  @lastUpdated 2026-09-19
 //
 //  Notes:
 //  - A cursor is (event ID, FSEvents UUID of the source volume). A different UUID means the volume's
@@ -24,9 +24,12 @@
 //    make a directory dirty — the same rule that keeps them from waking a pass. Marker files of the
 //    artifact rules (ArtifactRules.markerReach) are looked at before filtering: creating a CACHEDIR.TAG
 //    hides its own event, yet the folder whose listing it changes must be compared.
-//  - After HistoryDone the stream is flushed once (FSEventStreamFlushSync) to also collect events that
-//    happened just before the pass but were not delivered yet. The next cursor is the last event ID
-//    actually received, never "now": anything not delivered has a larger ID and is replayed next time.
+//  - HistoryDone comes after every event that happened before the stream was created (FSEvents' contract;
+//    measured: 120 of 120 writes made just before a replay were delivered before it). So the next cursor is
+//    the event ID taken just before the stream was created — or a later one received — and a source nothing
+//    happened in still moves on: its next replay covers only what is new, not everything since its last
+//    change (which, on a busy volume, outlasts the timeout). The stream is also flushed once after
+//    HistoryDone (FSEventStreamFlushSync), for events that happened meanwhile.
 //  - Events are mapped to paths relative to the source folder through every spelling of the root
 //    (SourceSpellings: as configured, realpath(3), and without the Data volume prefix).
 //
@@ -37,6 +40,34 @@ import Foundation
 struct JournalCursor: Codable, Equatable, Sendable {
     let eventID: UInt64
     let volumeUUID: String
+
+    /// Where a replay starts: this stored cursor, or the hint's later one — only when this cursor is at or
+    /// after the hint's base on the same journal, since the hint vouches for nothing before its base (a store
+    /// rolled back, a destination copy, another engine's older state). A shorter replay finishes within the
+    /// timeout where a long one would force a full scan.
+    func advanced(to hint: JournalHint?) -> JournalCursor {
+        guard let hint, hint.base.volumeUUID == volumeUUID, hint.cursor.volumeUUID == volumeUUID,
+              eventID >= hint.base.eventID, hint.cursor.eventID > eventID else { return self }
+        return hint.cursor
+    }
+}
+
+/// Nothing the backup would act on happened in a source between `base` — the cursor a pass stored — and
+/// `cursor` (BackupCoordinator's journal hints).
+struct JournalHint: Equatable, Sendable {
+    let base: JournalCursor
+    let cursor: JournalCursor
+
+    /// A pass's own cursor: quiet from itself to itself.
+    init(stored: JournalCursor) {
+        base = stored
+        cursor = stored
+    }
+
+    init(base: JournalCursor, cursor: JournalCursor) {
+        self.base = base
+        self.cursor = cursor
+    }
 }
 
 enum JournalChanges: Equatable, Sendable {
@@ -78,6 +109,7 @@ enum ChangeJournal {
                                            copyDescription: nil)
         let flags = UInt32(kFSEventStreamCreateFlagFileEvents | kFSEventStreamCreateFlagUseCFTypes
                            | kFSEventStreamCreateFlagNoDefer)
+        let createdAfter = FSEventsGetCurrentEventId()   // everything up to here comes before HistoryDone
         guard let stream = FSEventStreamCreate(kCFAllocatorDefault, ReplayCollector.callback, &context,
                                                [source.path] as CFArray, FSEventStreamEventId(cursor.eventID),
                                                0, flags) else {
@@ -98,7 +130,7 @@ enum ChangeJournal {
         let events = received.map { WatchEvent(path: $0.path, flags: $0.flags) }
         let relevant = ChangeFilter(sources: [source], exclusions: exclusions).relevantEvents(events)
         let markers = exclusions.skipsBuildArtifacts ? events.filter(isMarkerEvent) : []
-        let lastID = received.filter { $0.id != 0 }.map(\.id).max()
+        let lastID = max(createdAfter, received.filter { $0.id != 0 }.map(\.id).max() ?? 0)
         return directories(from: relevant, markers: markers, lastEventID: lastID, source: source)
     }
 
@@ -120,8 +152,8 @@ enum ChangeJournal {
     }
 
     /// Dirty directories for already-filtered events plus the folders that `markers` (artifact-rule
-    /// marker files, unfiltered) affect. `lastEventID` covers every received event, relevant or not, so
-    /// irrelevant churn still advances the cursor.
+    /// marker files, unfiltered) affect. `lastEventID` covers every received event, relevant or not, and the
+    /// replay's start, so irrelevant churn and quiet stretches still advance the cursor.
     static func directories(from events: [WatchEvent], markers: [WatchEvent] = [], lastEventID: UInt64?,
                             source: URL) -> JournalChanges {
         let roots = SourceSpellings.of(source)

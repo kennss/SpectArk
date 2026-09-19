@@ -80,7 +80,6 @@ enum Syscalls {
         try fullFsync(fd)
     }
 
-    /// Atomic publish within a single volume; replaces `dst` if it exists.
     /// Whether an item exists at `path` (not following a symlink). Only "there is none" is false: any other
     /// failure to look — a share that stopped answering — throws, so it is never taken for absence.
     static func exists(_ path: String) throws -> Bool {
@@ -90,6 +89,7 @@ enum Syscalls {
         throw InfraError(operation: "lstat", path: path, code: errno)
     }
 
+    /// Atomic publish within a single volume; replaces `dst` if it exists.
     static func atomicRename(_ src: String, to dst: String) throws {
         if rename(src, dst) != 0 {
             throw InfraError(operation: "rename", path: src, code: errno)

@@ -26,6 +26,13 @@
 //    fields are recorded only here; a settings edit keeps them.
 //  - When a (browsable) volume is mounted, jobs whose destination was away are found again and resume;
 //    a renamed volume re-locates every job. SpectArk's own NAS images are hidden volumes and ignored.
+//  - Journal hints: a pass replays the FSEvents journal from where the last one stopped, and a long idle
+//    stretch on a busy volume makes that replay outlast its timeout (a full scan instead — measured: 1 h 43 m
+//    idle, "journal replay timed out"). So while a realtime job idles, every five minutes its journal is
+//    replayed from the cursors its last pass stored (or the last quiet check reached) — a few minutes of
+//    events, quick — and when nothing the backup would act on happened, the cursors move up to that replay's
+//    start: its next pass starts there. A replay sees everything, SpectArk's own writes (a restore) too; a
+//    pass begun meanwhile discards the check. Hints live in memory only.
 //
 
 import AppKit
@@ -54,6 +61,12 @@ final class BackupCoordinator {
     private var meters: [UUID: ThroughputMeter] = [:]
     private var scheduleTicker: Task<Void, Never>?
     private var volumeObservers: [NSObjectProtocol] = []
+    /// Per job and source: the cursor its last pass stored, and how far its journal is known quiet since
+    /// (moved up by quiet checks) — where its next pass may start its replays.
+    private var journalHints: [UUID: [String: JournalHint]] = [:]
+    /// Per job: passes begun, so a quiet check that a pass overtook is discarded.
+    private var passesBegun: [UUID: Int] = [:]
+    private var ticks = 0
     private static let log = Logger(subsystem: "ai.calidalab.spectabackup", category: "destination")
     /// Per job: the number of the latest `locate` started, and of the latest whose result was taken over —
     /// an older one finishing late must not undo a newer one.
@@ -102,6 +115,7 @@ final class BackupCoordinator {
         stopWatcher(id)
         cancelArmedPass(id)
         schedulers[id] = nil
+        journalHints[id] = nil
         let job = jobs.first(where: { $0.id == id })
         jobs.removeAll { $0.id == id }
         states[id] = nil
@@ -210,11 +224,14 @@ final class BackupCoordinator {
         st.lastError = nil
         st.progress = BackupProgress()
         states[jobID] = st
+        let hints = journalHints[jobID] ?? [:]
+        passesBegun[jobID, default: 0] += 1
 
-        Task { await execute(job: job, quietWindow: quietWindow, requested: requested) }
+        Task { await execute(job: job, quietWindow: quietWindow, requested: requested, hints: hints) }
     }
 
-    private func execute(job: BackupJob, quietWindow: TimeInterval, requested: Bool) async {
+    private func execute(job: BackupJob, quietWindow: TimeInterval, requested: Bool,
+                         hints: [String: JournalHint]) async {
         let jobID = job.id
         meters[jobID] = ThroughputMeter()
         let progress: @Sendable (BackupProgress) -> Void = { p in
@@ -227,18 +244,20 @@ final class BackupCoordinator {
             let job = try await locate(jobID)
             updateFreeSpace(jobID)
             let result = try await runner(for: job).run(job: job, quietWindow: quietWindow, forceCheckpoint: requested,
-                                              progress: progress)
+                                                        journalHints: hints, progress: progress)
             let history = try? await runner(for: job).history(for: job)
             guard jobs.contains(where: { $0.id == jobID }) else { return forgetRemovedJob(jobID) }
             var st = state(for: jobID)
             st.isRunning = false
             st.throughputBytesPerSec = 0
             st.lastBackup = result.finishedAt
+            st.lastWarning = result.warning
             if let history { st.apply(history) }
             states[jobID] = st
             updateFreeSpace(jobID)
             deferredCount = result.deferredCount
             succeeded = true
+            journalHints[jobID] = result.journalCursors.mapValues(JournalHint.init(stored:))
         } catch {
             guard jobs.contains(where: { $0.id == jobID }) else { return forgetRemovedJob(jobID) }
             var st = state(for: jobID)
@@ -261,6 +280,8 @@ final class BackupCoordinator {
         schedulers[jobID] = nil
         meters[jobID] = nil
         states[jobID] = nil
+        journalHints[jobID] = nil
+        passesBegun[jobID] = nil
     }
 
     private func applyProgress(_ p: BackupProgress, for jobID: UUID) {
@@ -465,6 +486,7 @@ final class BackupCoordinator {
                 try? await Task.sleep(for: .seconds(60))
                 if Task.isCancelled { break }
                 self?.checkSchedules()
+                self?.refreshJournalHintsEveryFewMinutes()
             }
         }
     }
@@ -492,6 +514,42 @@ final class BackupCoordinator {
         }
         watcher.start()
         watchers[jobID] = watcher
+    }
+
+    /// Every five minutes: move each idle realtime job's journal hints up past the quiet stretch since.
+    private func refreshJournalHintsEveryFewMinutes() {
+        ticks += 1
+        guard ticks % 5 == 0 else { return }
+        for job in jobs where Self.runsOnChanges(job) {
+            guard let hints = journalHints[job.id], !hints.isEmpty,
+                  schedulers[job.id]?.isBusy != true, armedPasses[job.id] == nil else { continue }
+            let jobID = job.id
+            let begun = passesBegun[jobID, default: 0]
+            Task {
+                let advanced = await Task.detached(priority: .utility) { Self.quietCursors(job, from: hints) }.value
+                // A pass begun meanwhile stored newer cursors of its own.
+                guard passesBegun[jobID, default: 0] == begun, journalHints[jobID] == hints else { return }
+                journalHints[jobID] = advanced
+            }
+        }
+    }
+
+    /// Each source's hint moved up to where its journal is quiet: replayed from the hint, a source with
+    /// nothing the backup would act on since moves to the replay's start (ChangeJournal); any other keeps its
+    /// hint. The base — what the hint vouches from — never moves.
+    nonisolated static func quietCursors(_ job: BackupJob, from hints: [String: JournalHint]) -> [String: JournalHint] {
+        let exclusions = BackupExclusions(job: job)
+        var advanced = hints
+        for source in job.sources {
+            let name = source.lastPathComponent
+            guard let hint = hints[name],
+                  case let .directories(dirty, lastEventID) = ChangeJournal.changes(in: source, since: hint.cursor,
+                                                                                   exclusions: exclusions),
+                  dirty.isEmpty, let lastEventID, lastEventID > hint.cursor.eventID else { continue }
+            advanced[name] = JournalHint(base: hint.base,
+                                         cursor: JournalCursor(eventID: lastEventID, volumeUUID: hint.cursor.volumeUUID))
+        }
+        return advanced
     }
 
     /// Stop watching a job's sources. An armed pass is kept: after a settings edit it still runs,

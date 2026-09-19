@@ -65,6 +65,20 @@ nothing is left the migration did not account for. Deleting inside an image free
 decides then, under the writer lock, whether any job's backups remain — none: the image is renamed away
 and deleted; some, or unreadable: it is compacted.
 
+Retention's own frees are given back too. When the idle timer detaches an image, the gap — what the share
+holds for it (band files × band size) beyond what its volume uses (ATTR_VOL_SPACEUSED) — is measured.
+Compaction gives back only bands left wholly free, so part of any gap is the image's own: its structures
+and free space scattered through bands still in use (measured on a 105 GB NAS image: 1.2 GB of gap, 72 MB
+given back, 3 minutes over SMB). The gap a compaction leaves is the baseline; the image is compacted again
+once the gap has grown 1 GB past it, and the baseline follows the gap down as later writes fill scattered
+space. APFS releases freed blocks to a large image only as later writes process its free queue, so a
+compaction that left more than 1 GB is followed up a day later; a follow-up that gives back less than
+1 GB settles the baseline, and a failed compaction is tried again a day later. What each image's
+compactions showed is kept across launches (ImageCompaction.json in Application Support, per image volume
+UUID) — otherwise every launch would spend minutes compacting what cannot be given back. A new image may
+grow to the share's size — not the quota, which retention keeps (an image exactly that full would fail a
+pass briefly above it).
+
 ### 3.2 Generations and checkpoints
 
 - The catalog keeps a **pending generation** `g` (starts at 1). A **checkpoint** seals generation `g`
@@ -137,9 +151,19 @@ batch, not per file.
   stream (`sinceWhen = cursor`, until `HistoryDone`, then one `FlushSync`), so changes made while
   SpectArk was not running are found without a full scan. The live watcher only decides *when* a pass
   runs; *what* it compares always comes from the replay.
-- The next cursor is the last event ID actually received — never "now". An event that had not reached
-  fseventsd when the pass started has a larger ID and is replayed by the next pass (which the watcher
-  schedules for it anyway), so nothing is lost to that race.
+- The next cursor is the event ID taken just before the replay stream was created (or a later one it
+  received): HistoryDone comes after every event that happened before the stream existed (FSEvents'
+  contract; 120 of 120 writes made just before a replay were delivered before it). An event after that
+  has a larger ID and is replayed by the next pass (which the watcher schedules for it anyway). A source
+  nothing happened in therefore still moves on — its next replay covers only what is new. (It used to
+  stay at its last received event, so a rarely changed source replayed everything since its last change
+  on every pass and, on a busy volume, timed out into a full scan: measured, ~Working after 1 h 43 m.)
+- Journal hints: while a realtime job idles, the coordinator replays its journal every five minutes from
+  where its last pass (or the last such check) stopped — minutes of events, quick — and when nothing the
+  backup would act on happened, its next pass may start from that replay's start. A replay sees
+  SpectArk's own writes (a restore) as well; a pass begun meanwhile discards the check. A hint carries the
+  cursor its pass stored (its base) and applies only to a store at or after that base on the same journal:
+  a store rolled back, a destination copy, or the other engine's older state gets nothing skipped.
 - Replayed events go through the job's ChangeFilter first: churn inside excluded folders (e.g.
   `node_modules`) makes nothing dirty, but still advances the cursor.
 - Events become dirty directories: the parent of each changed item (its listing changed), plus the
@@ -189,8 +213,32 @@ batch, not per file.
 
 ### 3.9 Encryption
 
-Encrypted jobs keep the content-addressed repo (DedupEngine). They adopt the same journal and
-checkpoint cadence later; their storage format is unchanged.
+Encrypted jobs keep the content-addressed repo (DedupEngine), and the repo is their only record: the
+restore points are its snapshots (RepoTimeline, with a local cache so the timeline shows without the
+password) — no catalog at the destination.
+
+- **Incremental passes.** The previous pass's snapshot is the parent. A file whose size and exact mtime
+  match its node there keeps that node unread; a folder FSEvents reported nothing in (the same journal and
+  rules as §3.7), still the same folder (inode recorded in its node) and with its subtree totals known,
+  keeps its tree unlisted. The journal cursors, the parent and the folders to list again live in a local
+  state (EncryptedCaptureState); without it — settings changed, once a day, parent gone — the whole source
+  is walked, still without reading unchanged files.
+- **Quiet window and torn reads** as the history engine: a file in its window, or changing while read, keeps
+  its previous node and its folder is listed again; a settle pass reads a restless file three times, then
+  keeps the last read recorded as of before it.
+- **Cadence.** Every pass that changed something writes a snapshot, so changes are protected at once; a pass
+  that changed nothing writes none (unless the restore point was requested). Retention then keeps a restore
+  point at most every 15 minutes (§3.3): the first once spacing has elapsed, each state left alone, the
+  newest, and every requested or migrated one.
+- **Retention and GC** (RepoMaintenance): the job's policy over the remaining snapshots, space rules with
+  exact per-snapshot freed bytes; dropped snapshots' data is collected (dead packs deleted, packs a quarter
+  dead rewritten, dead trees deleted) at most daily unless space is short, in an order an interruption can
+  only leak garbage from — and what takes no writing first, so a full disk gets space back. What is kept
+  is every snapshot object in the repo the plan did not drop; one that cannot be read stops the collection
+  and the space rules (the user is told), never loses its data. Listings and deletions report every error:
+  a listing that silently left something out would have the collection delete what it did not see.
+- **Durability.** Objects are written to a temp, fsynced and renamed; a write barrier (F_FULLFSYNC) precedes
+  and follows each snapshot, the commit point.
 
 ## 4. Alternatives considered
 
@@ -208,8 +256,12 @@ checkpoint cadence later; their storage format is unchanged.
 - Change detection is size + mtime, as in 1.1.x: a metadata-only change (permissions, xattrs) is not
   captured until the content changes.
 - Hard links inside a source are stored as independent files (content preserved, link not).
-- A file written continuously is captured at most once per settle pass (quiet window); a consistent
-  read of such files needs source snapshots (TODO P2).
+- A copy whose source changed while it was copied (or since the plan judged it settled) is dropped
+  and deferred, so a single file is never recorded torn — except one that never stops changing: a
+  settle pass keeps its last copy after three attempts (recorded as of just before it, so the next pass
+  copies it again). Files that must agree with each other (a SQLite database and its `-wal`, a Git
+  operation in progress) are copied one after another, not at one instant; that needs source
+  snapshots (TODO P2).
 - Catalog paths are stored in Unicode NFC (schema version 2), because SQLite compares bytes while APFS,
   HFS+ and Swift compare canonically equivalent names as equal. A restored name therefore comes back in
   NFC even if the source spelled it NFD (as Finder does for Korean names): it looks the same and the
@@ -278,4 +330,6 @@ Per job, on the first pass of the new engine (`HistorySeeder`, then a normal pas
   inside its sparsebundle over SMB in about 15 minutes.
 - FSEvents replay limits (how long the journal keeps history; behaviour on removable source volumes).
 - Replay time after a long absence (days of volume-wide events since the cursor) against the 30 s
-  timeout; only short spans have been measured so far.
+  timeout: 1 h 43 m of a busy volume already exceeded it (a full scan instead). While SpectArk runs the
+  journal hints keep spans short; the first pass after SpectArk was not running still replays the whole
+  absence.

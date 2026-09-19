@@ -18,6 +18,9 @@
 //  - Legacy (1.1.x) snapshot trees are no longer written. They stay browsable and restorable, are thinned
 //    together with the checkpoints on one timeline, and `.inprogress-*` partials of the old engine are
 //    discarded (nothing resumes them any more).
+//  - An encrypted job's restore points are its repo's snapshots (RepoTimeline): nothing else records
+//    them — no catalog at the destination. The repo is unlocked once per repo while the app runs. Its
+//    retention and garbage collection run after each encrypted pass (RepoMaintenance).
 //  - NAS jobs (sparsebundle strategy) keep their plaintext backups inside the destination's image. Every
 //    use — a pass, the timeline, a restore, a browsing session, a migration — holds it attached through
 //    the destination's ImageLease (`withPlaintextRoot`). An encrypted job's repo and catalog stay in the
@@ -30,6 +33,7 @@
 
 import Darwin
 import Foundation
+import os
 
 enum EncryptedBackupError: Error, CustomStringConvertible {
     case passwordMissing
@@ -48,6 +52,20 @@ enum RestoreError: Error, CustomStringConvertible {
 }
 
 actor BackupRunner {
+
+    /// An encrypted job's repo password (the Keychain; tests hand one in).
+    private let passwords: @Sendable (UUID) -> String?
+    /// An encrypted job's restore points, read from its repo.
+    private let timeline: RepoTimeline
+    /// Unlocked repo keys by repo path, with the identity of the repo they unlock (RepoTimeline.identity):
+    /// the KDF runs once per repo while the app runs, and a repo created anew at the path is unlocked anew.
+    private var unlocked: [String: (repo: String, config: RepoConfig, keys: RepoKeys)] = [:]
+
+    init(passwords: @escaping @Sendable (UUID) -> String? = { KeychainStorage.password(for: $0) },
+         timeline: RepoTimeline = RepoTimeline()) {
+        self.passwords = passwords
+        self.timeline = timeline
+    }
 
     // MARK: - One operation at a time
 
@@ -75,23 +93,33 @@ actor BackupRunner {
         let capabilities: DestinationCapabilities
         /// Files the pass left for later because they were still being written (quiet window).
         let deferredCount: Int
+        /// Something the user should know although the backup succeeded.
+        var warning: String? = nil
+        /// Where the journal now stands for the job: the cursors the pass stored, per source name.
+        var journalCursors: [String: JournalCursor] = [:]
     }
 
     /// Run one backup pass for a job. `forceCheckpoint`: the pass was requested (Back Up Now, a due
     /// schedule, a new job) and ends with a checkpoint — an explicit restore point.
+    /// `journalHints`: per source name, a later cursor its journal replay may start from (the coordinator
+    /// vouches that nothing relevant happened since the stored one — JournalCursor.advanced).
     func run(job: BackupJob,
              quietWindow: TimeInterval = 0,
              forceCheckpoint: Bool = false,
+             journalHints: [String: JournalHint] = [:],
              progress: @escaping @Sendable (BackupProgress) -> Void) async throws -> PassResult {
         try await exclusively {
-            try await runPass(job: job, quietWindow: quietWindow, forceCheckpoint: forceCheckpoint, progress: progress)
+            try await runPass(job: job, quietWindow: quietWindow, forceCheckpoint: forceCheckpoint,
+                              journalHints: journalHints, progress: progress)
         }
     }
 
     private func runPass(job: BackupJob, quietWindow: TimeInterval, forceCheckpoint: Bool,
+                         journalHints: [String: JournalHint],
                          progress: @escaping @Sendable (BackupProgress) -> Void) async throws -> PassResult {
         if job.encryptionEnabled {
-            return try await runEncrypted(job: job, progress: progress)
+            return try await runEncrypted(job: job, quietWindow: quietWindow, forceCheckpoint: forceCheckpoint,
+                                          journalHints: journalHints, progress: progress)
         }
         let caps = try DestinationProbe.probe(destination: job.destination)
         // A job that 1.1.x already backed up directly onto this volume stays there (an NFS share with
@@ -99,7 +127,8 @@ actor BackupRunner {
         let inImage = try Self.usesImage(job) || (caps.strategy == .sparsebundle && !(try Self.hasDirectLayout(job)))
         return try await withPlaintextRoot(job, inImage: inImage, create: true, writes: true) { jobRoot in
             try await runHistoryPass(job: job, jobRoot: jobRoot, inImage: inImage, capabilities: caps,
-                                     quietWindow: quietWindow, forceCheckpoint: forceCheckpoint, progress: progress)
+                                     quietWindow: quietWindow, forceCheckpoint: forceCheckpoint,
+                                     journalHints: journalHints, progress: progress)
         }
     }
 
@@ -107,6 +136,7 @@ actor BackupRunner {
     /// apply retention to the job's whole timeline.
     private func runHistoryPass(job: BackupJob, jobRoot: URL, inImage: Bool, capabilities: DestinationCapabilities,
                                 quietWindow: TimeInterval, forceCheckpoint: Bool,
+                                journalHints: [String: JournalHint],
                                 progress: @escaping @Sendable (BackupProgress) -> Void) async throws -> PassResult {
         try FileManager.default.createDirectory(at: jobRoot, withIntermediateDirectories: true)
         sweepScratch(in: jobRoot)
@@ -122,55 +152,229 @@ actor BackupRunner {
 
         let outcome = try CaptureEngine(layout: layout).runPass(job: job, quietWindow: quietWindow,
                                                                 forceCheckpoint: forceCheckpoint,
+                                                                journalHints: journalHints,
                                                                 progress: progress)
         // Inside a NAS image, dropped trees must be gone before it is detached; elsewhere they go in the
         // background (TreeReaper) so their deletion holds up no pass.
         await applyRetention(job: job, layout: layout, jobRoot: jobRoot, legacy: legacy, reapInBackground: !inImage)
         return PassResult(finishedAt: outcome.finishedAt, capabilities: capabilities,
-                          deferredCount: outcome.deferredCount)
+                          deferredCount: outcome.deferredCount, journalCursors: outcome.journalCursors)
     }
 
-    /// Encrypted path: unlock the dedup repo and run DedupEngine, recording the snapshot in the legacy
-    /// catalog so the timeline stays unified. The repo is created in Settings (where the recovery key can
-    /// be shown), not here. Encrypted-repo retention (prune/GC) is a follow-up.
-    private func runEncrypted(job: BackupJob,
+    /// Encrypted path: unlock the dedup repo and run DedupEngine; the snapshot it writes is the restore
+    /// point's only record. The repo is created in Settings (where the recovery key can be shown), not here.
+    private func runEncrypted(job: BackupJob, quietWindow: TimeInterval, forceCheckpoint: Bool,
+                              journalHints: [String: JournalHint],
                               progress: @escaping @Sendable (BackupProgress) -> Void) async throws -> PassResult {
-        guard let password = KeychainStorage.password(for: job.id) else {
-            throw EncryptedBackupError.passwordMissing
-        }
         let caps = try DestinationProbe.probe(destination: job.destination)
         let jobRoot = Self.jobRoot(for: job)
         try FileManager.default.createDirectory(at: jobRoot, withIntermediateDirectories: true)
         sweepScratch(in: jobRoot)   // the remains of an interrupted migration
-        let backend = try LocalBackend(root: jobRoot.appendingPathComponent("repo", isDirectory: true))
-        guard await RepoManager.isInitialized(backend) else {
-            throw EncryptedBackupError.repoNotInitialized
-        }
-
-        let (config, keys) = try await RepoManager.unlock(backend: backend, password: Data(password.utf8))
+        guard let backend = try existingRepo(of: job) else { throw EncryptedBackupError.repoNotInitialized }
+        let (config, keys) = try await unlockRepo(backend, job: job)
         let engine = DedupEngine(backend: backend, keys: keys, chunker: config.chunker)
         try await engine.open()   // load the blob index so existing blobs are deduplicated, not re-stored
 
-        let catalog = try CatalogStore(path: jobRoot.appendingPathComponent("catalog.sqlite").path)
-        await finishLegacyDeletions(in: jobRoot.appendingPathComponent("snapshots", isDirectory: true), job: job,
-                                    legacy: catalog, reapInBackground: true)
+        // A catalog from before the repo was the record: an interrupted deletion is finished, and one left
+        // with nothing plaintext to list goes (on a NAS it was SQLite over SMB).
+        if let legacy = Self.legacyCatalog(at: jobRoot) {
+            await finishLegacyDeletions(in: jobRoot.appendingPathComponent("snapshots", isDirectory: true), job: job,
+                                        legacy: legacy, reapInBackground: true)
+            if await adoptLegacyMarkers(legacy, job: job, repo: backend, keys: keys) {
+                await discardLegacyCatalogIfSpent(legacy, at: jobRoot, job: job)
+            }
+        }
         let now = Date()
-        let seqId = try await catalog.beginSnapshot(jobID: job.id, timestamp: now, sourceSnapshotID: nil)
-        let snapshotID = "enc-\(seqId)"
-        let start = Date()
+        let snapshotID = RepoTimeline.newSnapshotID(at: now)
+        let plan = await encryptedCapturePlan(job: job, repo: backend, keys: keys, quietWindow: quietWindow,
+                                              hints: journalHints, now: now)
+        let result: DedupEngine.BackUpResult
         do {
-            let snap = try await engine.backUp(sources: job.sources, snapshotID: snapshotID,
-                                               now: now.timeIntervalSince1970,
-                                               exclusions: BackupExclusions(job: job),
-                                               toleratingVanishedEntries: true)
-            let durationMs = Int(Date().timeIntervalSince(start) * 1000)
-            try await catalog.markComplete(seqId: seqId, dirName: snapshotID, fileCount: snap.fileCount,
-                                           logicalBytes: Int64(snap.totalBytes), addedBlocks: 0, durationMs: durationMs)
-            return PassResult(finishedAt: Date(), capabilities: caps, deferredCount: 0)   // no quiet window here
+            result = try await engine.backUp(sources: job.sources, snapshotID: snapshotID,
+                                             now: now.timeIntervalSince1970, requested: forceCheckpoint,
+                                             incremental: plan.incremental, exclusions: BackupExclusions(job: job),
+                                             toleratingVanishedEntries: true)
         } catch {
-            try? await catalog.markFailed(seqId: seqId)
+            // A pass that failed — the disk full, say — still gets its retention: space pressure collects at
+            // once, so the next pass can succeed.
+            _ = await applyEncryptedRetention(job: job, repo: backend, keys: keys)
             throw error
         }
+        let finished = Date()
+        let warning = await applyEncryptedRetention(job: job, repo: backend, keys: keys)
+        // The next pass starts from the snapshot that holds this state, and from where the journal was read up to.
+        timeline.recordCapture(job.id, EncryptedCaptureState(
+            parent: result.snapshotID, fingerprint: plan.fingerprint, cursors: plan.cursors, carried: result.carried,
+            lastFullScan: plan.walkedWhole ? now.timeIntervalSince1970 : plan.lastFullScan,
+            lastPassEnd: finished.timeIntervalSince1970))
+        return PassResult(finishedAt: finished, capabilities: caps, deferredCount: result.deferred, warning: warning,
+                          journalCursors: plan.cursors)
+    }
+
+    private struct EncryptedCapturePlan {
+        var incremental: DedupEngine.Incremental
+        var fingerprint: String
+        var cursors: [String: JournalCursor] = [:]
+        /// Every source is walked whole this pass.
+        var walkedWhole = true
+        var lastFullScan: Double?
+    }
+
+    private static let log = Logger(subsystem: "ai.calidalab.spectabackup", category: "encrypted")
+
+    /// What an encrypted pass takes from the last one (as the history engine's discover, docs §3.7): its
+    /// snapshot as the parent — unchanged files are not read again — and, while the journal can say, only
+    /// the folders changed since. A full walk after a settings change, once a day, and whenever the state
+    /// is missing or its parent gone; then the newest snapshot a pass wrote still spares unchanged files.
+    private func encryptedCapturePlan(job: BackupJob, repo: LocalBackend, keys: RepoKeys, quietWindow: TimeInterval,
+                                      hints: [String: JournalHint], now: Date) async -> EncryptedCapturePlan {
+        let fingerprint = CaptureEngine.fingerprint(of: job)
+        var state = timeline.captureState(job.id)
+        if let parent = state?.parent, ((try? await repo.stat(key: "snapshots/\(parent)")) ?? nil) == nil { state = nil }
+        var plan = EncryptedCapturePlan(incremental: .init(parent: state?.parent, quietWindow: quietWindow),
+                                        fingerprint: fingerprint, lastFullScan: state?.lastFullScan)
+        if state == nil, let newest = (try? await timeline.snapshots(jobID: job.id, backend: repo, keys: keys))?
+            .filter({ $0.origin == nil }).max(by: { $0.createdAt < $1.createdAt }) {
+            plan.incremental.parent = newest.id
+        }
+        let reason: String?
+        if state == nil {
+            reason = "no state from the last pass"
+        } else if state?.fingerprint != fingerprint {
+            reason = "settings or built-in rules changed"
+        } else if state?.lastFullScan.map({ now.timeIntervalSince1970 - $0 >= CaptureEngine.safetyScanInterval }) ?? true {
+            reason = "daily safety scan"
+        } else {
+            reason = nil
+        }
+        let exclusions = BackupExclusions(job: job)
+        for source in job.sources {
+            let name = source.lastPathComponent
+            let cursorAtStart = ChangeJournal.cursorNow(for: source)   // before anything is read
+            let recorded = state?.cursors[name]
+            let stored = recorded?.advanced(to: hints[name])
+            if let recorded, let stored, stored != recorded {
+                Self.log.notice("journal replay of \(name, privacy: .public) (encrypted) starts from a quiet check, \(stored.eventID - recorded.eventID) events past the stored cursor")
+            }
+            var changes = JournalChanges.fullScan(reason: reason ?? "no cursor stored")
+            if reason == nil, let stored {
+                changes = ChangeJournal.changes(in: source, since: stored, exclusions: exclusions)
+            }
+            switch changes {
+            case let .directories(dirty, lastEventID):
+                plan.incremental.scopes[name] = .init(dirty: dirty, carried: state?.carried[name] ?? [])
+                if let stored {
+                    plan.cursors[name] = JournalCursor(eventID: max(lastEventID ?? 0, stored.eventID),
+                                                       volumeUUID: stored.volumeUUID)
+                }
+                plan.walkedWhole = false
+            case let .fullScan(why):
+                Self.log.notice("full walk of \(name, privacy: .public) (encrypted): \(why, privacy: .public)")
+                if let cursorAtStart { plan.cursors[name] = cursorAtStart }
+            }
+        }
+        return plan
+    }
+
+    /// Thin the encrypted job's snapshots with its policy and collect what they no longer need — at most
+    /// once a day, unless space is short (RepoMaintenance). A failure leaves garbage for the next run, never a
+    /// snapshot without its data; returns what the user should know when old restore points cannot be
+    /// cleaned up.
+    private func applyEncryptedRetention(job: BackupJob, repo: LocalBackend, keys: RepoKeys) async -> String? {
+        let now = Date()
+        do {
+            let listing = try await timeline.listing(jobID: job.id, backend: repo, keys: keys)
+            let free = (try? Syscalls.volumeInfo(at: repo.root.path))?.freeBytes ?? Int64.max
+            let outcome = try await RepoMaintenance(backend: repo, keys: keys).run(
+                policy: job.retention, snapshots: listing.snapshots, freeBytes: free,
+                collect: timeline.collectionDue(job.id, now: now), now: now)
+            if outcome.collected { timeline.recordCollection(job.id, at: now) }
+            let unreadable = Set(listing.unreadable).union(outcome.unreadable)
+            guard unreadable.isEmpty else {
+                Self.log.error("encrypted repo of \(job.name, privacy: .public): unreadable snapshots \(unreadable.sorted(), privacy: .public)")
+                return "An encrypted restore point could not be read, so space from old restore points is not being "
+                    + "reclaimed. New backups continue."
+            }
+            return nil
+        } catch {
+            Self.log.error("encrypted retention of \(job.name, privacy: .public) failed: \(String(describing: error), privacy: .public)")
+            return "Old encrypted restore points could not be cleaned up: " + BackupErrorMessage.describe(error)
+        }
+    }
+
+    // MARK: - Encrypted repo
+
+    /// The job's encrypted repo, when it has one (never created here: that is Settings' job, where the
+    /// recovery key can be shown).
+    private func existingRepo(of job: BackupJob) throws -> LocalBackend? {
+        let root = Self.jobRoot(for: job).appendingPathComponent("repo", isDirectory: true)
+        guard try Syscalls.exists(root.appendingPathComponent(RepoManager.configKey).path) else { return nil }
+        return try LocalBackend(root: root)
+    }
+
+    /// The repo's keys, unlocked with `password` or the job's stored one — once per repo.
+    private func unlockRepo(_ backend: LocalBackend, job: BackupJob,
+                            password: String? = nil) async throws -> (config: RepoConfig, keys: RepoKeys) {
+        let key = backend.root.standardizedFileURL.path
+        let repo = try await RepoTimeline.identity(of: backend)
+        if let known = unlocked[key], known.repo == repo { return (known.config, known.keys) }
+        guard let password = password ?? passwords(job.id) else { throw EncryptedBackupError.passwordMissing }
+        let result = try await RepoManager.unlock(backend: backend, password: Data(password.utf8))
+        unlocked[key] = (repo, result.config, result.keys)
+        return result
+    }
+
+    /// The job's encrypted snapshots, as the timeline shows them. Without the password (not stored, not
+    /// unlocked yet) only those the local cache knows.
+    private func encryptedSnapshots(of job: BackupJob) async throws -> [RepoSnapshotSummary] {
+        guard let backend = try existingRepo(of: job) else { return [] }
+        let keys = try? await unlockRepo(backend, job: job).keys
+        return try await timeline.snapshots(jobID: job.id, backend: backend, keys: keys)
+    }
+
+    /// Markers a catalog at the job root recorded for encrypted snapshots (the migrations of earlier builds):
+    /// written into those snapshots themselves (their origin) before the catalog may go, so the repo alone
+    /// knows which points a migration encrypted — and the cadence never thins a migrated point.
+    /// True when every marker is in its snapshot now (or its snapshot is gone): only then may the catalog go.
+    private func adoptLegacyMarkers(_ legacy: CatalogStore, job: BackupJob, repo: LocalBackend, keys: RepoKeys) async -> Bool {
+        let prefix = "snapshots/"
+        guard let rows = try? await legacy.snapshots(jobID: job.id),
+              let listed = try? await repo.list(prefix: "snapshots") else { return false }
+        let present = Set(listed.map { String($0.dropFirst(prefix.count)) })
+        let cipher = BlobCipher(keys: keys)
+        var complete = true
+        var rewritten: [String] = []
+        for row in rows where row.status == .complete && present.contains(row.dirName) {
+            guard let marker = row.sourceSnapshotID else { continue }
+            let key = prefix + row.dirName
+            guard let sealed = try? await repo.get(key: key),
+                  var snapshot = try? JSONDecoder().decode(Snapshot.self, from: cipher.openMetadata(sealed, context: key)) else {
+                complete = false   // unreadable for now: the catalog keeps the marker
+                continue
+            }
+            guard snapshot.origin == nil else { continue }
+            snapshot.origin = marker
+            guard let data = try? JSONEncoder().encode(snapshot),
+                  let resealed = try? cipher.sealMetadata(data, context: key),
+                  (try? await repo.put(key: key, data: resealed)) != nil else {
+                complete = false
+                continue
+            }
+            rewritten.append(row.dirName)
+        }
+        if !rewritten.isEmpty {
+            if (try? await repo.sync()) == nil { complete = false }
+            timeline.refresh(job.id, snapshots: rewritten)
+        }
+        return complete
+    }
+
+    /// A 1.1.x catalog at the job root that no longer lists anything plaintext — only encrypted snapshots,
+    /// which the repo records itself (their markers adopted first): removed.
+    private func discardLegacyCatalogIfSpent(_ legacy: CatalogStore, at jobRoot: URL, job: BackupJob) async {
+        guard let rows = try? await legacy.snapshots(jobID: job.id), !rows.contains(where: Self.isPlaintext) else { return }
+        let path = jobRoot.appendingPathComponent("catalog.sqlite").path
+        for suffix in ["", "-wal", "-shm"] { try? FileManager.default.removeItem(atPath: path + suffix) }
     }
 
     // MARK: - Retention
@@ -299,7 +503,10 @@ actor BackupRunner {
         await exclusively {
             // Decided before the job root goes (it decides); when the share cannot tell, look in the image too.
             let inImage = (try? Self.usesImage(job)) ?? true
+            let repo = Self.jobRoot(for: job).appendingPathComponent("repo", isDirectory: true)
+            unlocked[repo.standardizedFileURL.path] = nil
             deleteSnapshotTree(Self.jobRoot(for: job))
+            timeline.forget(job.id)
             if inImage { removeFromImage(job) }
         }
     }
@@ -327,8 +534,20 @@ actor BackupRunner {
         guard FileManager.default.fileExists(atPath: job.destination.path) else {
             throw CocoaError(.fileNoSuchFile, userInfo: [NSFilePathErrorKey: job.destination.path])
         }
-        // The job root on the destination: all of a direct job's backups, an encrypted job's snapshots.
+        // The job root on the destination: a direct job's plaintext backups.
         var history = await backups(at: Self.jobRoot(for: job), of: job)
+        // Encrypted snapshots: the repo is their record. A pass that found nothing changed wrote none, but
+        // brought the backup up to date all the same.
+        for snapshot in (try? await encryptedSnapshots(of: job)) ?? [] {
+            let time = Date(timeIntervalSince1970: snapshot.createdAt)
+            history.points.append(RestorePoint(source: .encryptedSnapshot(id: snapshot.id), time: time,
+                                               fileCount: Int64(snapshot.fileCount), bytes: Int64(snapshot.totalBytes)))
+            history.lastBackup = max(history.lastBackup ?? time, time)
+        }
+        if let end = timeline.captureState(job.id)?.lastPassEnd {
+            let time = Date(timeIntervalSince1970: end)
+            history.lastBackup = max(history.lastBackup ?? time, time)
+        }
         if try Self.usesImage(job) {
             // A NAS job's plaintext backups, in the image.
             let inImage = try await withPlaintextRoot(job, inImage: true, writes: false) { root in
@@ -345,17 +564,16 @@ actor BackupRunner {
         return history
     }
 
-    /// The restore points and footprint of the backups kept at `jobRoot` (unsorted).
+    /// The plaintext restore points and footprint of the backups kept at `jobRoot` (unsorted). Encrypted
+    /// snapshots a 1.1.x catalog lists as well are the repo's to list.
     private func backups(at jobRoot: URL, of job: BackupJob) async -> BackupHistory {
         var history = BackupHistory()
         // Each part on its own: a damaged catalog must not hide the other kind of restore point.
         var plaintextLegacy = 0
         if let legacy = Self.legacyCatalog(at: jobRoot), let snapshots = try? await legacy.snapshots(jobID: job.id) {
-            for snapshot in snapshots where snapshot.status == .complete {
-                if Self.isPlaintext(snapshot) { plaintextLegacy += 1 }
-                let source: RestorePoint.Source = Self.isPlaintext(snapshot)
-                    ? .legacySnapshot(dirName: snapshot.dirName) : .encryptedSnapshot(id: snapshot.dirName)
-                history.points.append(RestorePoint(source: source, time: snapshot.timestamp,
+            for snapshot in snapshots where Self.isPlaintext(snapshot) {
+                plaintextLegacy += 1
+                history.points.append(RestorePoint(source: .legacySnapshot(dirName: snapshot.dirName), time: snapshot.timestamp,
                                                    fileCount: Int64(snapshot.fileCount), bytes: snapshot.logicalBytes))
                 history.storageBytes += snapshot.addedBlocks * 512
                 history.lastBackup = max(history.lastBackup ?? snapshot.timestamp, snapshot.timestamp)
@@ -491,12 +709,9 @@ actor BackupRunner {
     /// Restore an entire encrypted snapshot into a target folder (each backed-up source becomes a
     /// subfolder). File-by-file selection for encrypted repos is a follow-up.
     func restoreEncrypted(job: BackupJob, snapshotID: String, to target: URL) async throws {
-        guard let password = KeychainStorage.password(for: job.id) else {
-            throw EncryptedBackupError.passwordMissing
-        }
         try await exclusively {
-            let backend = try LocalBackend(root: Self.jobRoot(for: job).appendingPathComponent("repo", isDirectory: true))
-            let (config, keys) = try await RepoManager.unlock(backend: backend, password: Data(password.utf8))
+            guard let backend = try existingRepo(of: job) else { throw EncryptedBackupError.repoNotInitialized }
+            let (config, keys) = try await unlockRepo(backend, job: job)
             let engine = DedupEngine(backend: backend, keys: keys, chunker: config.chunker)
             try await engine.restore(snapshotID: snapshotID, to: target)
         }
@@ -528,17 +743,11 @@ actor BackupRunner {
         }
     }
 
-    /// The plaintext restore points at `plaintextRoot`, each with whether a migration encrypted it already:
-    /// its marker is recorded with an encrypted snapshot, in the catalog of the job root on the destination
-    /// (where the repo is). A catalog that exists but cannot be read throws: its points are unknown, and
+    /// The plaintext restore points at `plaintextRoot`, each with whether a migration encrypted it already
+    /// (`encryptedOrigins`). A catalog that exists but cannot be read throws: its points are unknown, and
     /// its data must never be discarded unencrypted.
     private func plaintextPoints(for job: BackupJob,
                                  at plaintextRoot: URL) async throws -> [(point: PlaintextPoint, encrypted: Bool)] {
-        var encrypted = Set<String>()
-        if let catalog = try Self.openLegacyCatalog(at: Self.jobRoot(for: job)) {
-            encrypted = Set(try await catalog.snapshots(jobID: job.id)
-                .filter { $0.status == .complete }.compactMap(\.sourceSnapshotID))
-        }
         var points: [PlaintextPoint] = []
         if let catalog = try Self.openLegacyCatalog(at: plaintextRoot) {
             points += try await catalog.snapshots(jobID: job.id)
@@ -552,7 +761,26 @@ actor BackupRunner {
                 points.append(.history(seq: nil, time: end))
             }
         }
+        guard !points.isEmpty else { return [] }
+        let encrypted = try await encryptedOrigins(of: job)
         return points.map { ($0, encrypted.contains($0.marker)) }
+    }
+
+    /// Markers of the plaintext restore points already in the repo: each encrypted snapshot's origin, and —
+    /// from before the repo was the record — the markers the job root's 1.1.x catalog recorded. Without the
+    /// repo's keys, snapshots the timeline cache does not know are left out: their points are taken for not
+    /// encrypted yet (encrypted again, never deleted unencrypted).
+    private func encryptedOrigins(of job: BackupJob) async throws -> Set<String> {
+        var origins = Set(try await encryptedSnapshots(of: job).compactMap(\.origin))
+        // A marker is only as good as its snapshot: one retention has dropped encrypts nothing any more.
+        if let catalog = try Self.openLegacyCatalog(at: Self.jobRoot(for: job)) {
+            let prefix = "snapshots/"
+            let present = Set(try await existingRepo(of: job)?.list(prefix: "snapshots")
+                .map { String($0.dropFirst(prefix.count)) } ?? [])
+            origins.formUnion(try await catalog.snapshots(jobID: job.id)
+                .filter { $0.status == .complete && present.contains($0.dirName) }.compactMap(\.sourceSnapshotID))
+        }
+        return origins
     }
 
     /// Plaintext restore points a job still has on disk — encrypted by an interrupted migration or not, a
@@ -573,7 +801,7 @@ actor BackupRunner {
     /// intact (no data loss, no half-deleted state). Each point keeps every top-level folder it holds,
     /// including sources since removed from the job.
     func migrateToEncrypted(job: BackupJob, progress: @escaping @Sendable (Int, Int) -> Void) async throws {
-        guard let password = KeychainStorage.password(for: job.id) else {
+        guard let password = passwords(job.id) else {
             throw EncryptedBackupError.passwordMissing
         }
         try await migrateToEncrypted(job: job, password: password, progress: progress)
@@ -604,11 +832,18 @@ actor BackupRunner {
         let jobRoot = Self.jobRoot(for: job)
         let layout = HistoryLayout(jobRoot: plaintextRoot)
         sweepScratch(in: plaintextRoot)
+        let repo = try existingRepo(of: job)
+        // Unlocked first: which points are encrypted already is recorded in the repo.
+        var unlockedRepo: (config: RepoConfig, keys: RepoKeys)?
+        if let repo { unlockedRepo = try await unlockRepo(repo, job: job, password: password) }
+        var markersAdopted = true
+        if let repo, let unlockedRepo, let legacy = Self.legacyCatalog(at: jobRoot) {
+            markersAdopted = await adoptLegacyMarkers(legacy, job: job, repo: repo, keys: unlockedRepo.keys)
+        }
         let points = try await plaintextPoints(for: job, at: plaintextRoot)
         let historyData = try Self.historyDataExists(layout)
         let snapshotsDir = plaintextRoot.appendingPathComponent("snapshots", isDirectory: true)
-        let encryptedCatalog = try CatalogStore(path: jobRoot.appendingPathComponent("catalog.sqlite").path)
-        let plaintextCatalog = inImage ? try Self.openLegacyCatalog(at: plaintextRoot) : encryptedCatalog
+        let plaintextCatalog = try Self.openLegacyCatalog(at: plaintextRoot)
         if let plaintextCatalog {
             await finishLegacyDeletions(in: snapshotsDir, job: job, legacy: plaintextCatalog,
                                         reapInBackground: !inImage)
@@ -618,9 +853,8 @@ actor BackupRunner {
         // 1) Re-encrypt every point not encrypted yet. A failure throws → plaintext stays untouched.
         let pending = points.filter { !$0.encrypted }.map(\.point)
         if !pending.isEmpty {
-            let backend = try LocalBackend(root: jobRoot.appendingPathComponent("repo", isDirectory: true))
-            let (config, keys) = try await RepoManager.unlock(backend: backend, password: Data(password.utf8))
-            let engine = DedupEngine(backend: backend, keys: keys, chunker: config.chunker)
+            guard let repo, let unlockedRepo else { throw EncryptedBackupError.repoNotInitialized }
+            let engine = DedupEngine(backend: repo, keys: unlockedRepo.keys, chunker: unlockedRepo.config.chunker)
             try await engine.open()   // load the blob index up front so restore points dedup against each other
 
             for (index, point) in pending.enumerated() {
@@ -628,14 +862,12 @@ actor BackupRunner {
                 switch point {
                 case let .legacy(snap):
                     let roots = try Self.topLevelFolders(of: snapshotsDir.appendingPathComponent(snap.dirName, isDirectory: true))
-                    try await encrypt(roots, at: snap.timestamp, marker: point.marker, into: engine,
-                                      catalog: encryptedCatalog, job: job)
+                    try await encrypt(roots, at: snap.timestamp, marker: point.marker, into: engine)
                 case let .history(seq, time):
                     let tree = plaintextRoot.appendingPathComponent(".materialize-\(UUID().uuidString)", isDirectory: true)
                     defer { deleteSnapshotTree(tree) }
                     let roots = try HistoryMaterializer(layout: layout).materialize(at: seq, into: tree)
-                    try await encrypt(roots, at: time, marker: point.marker, into: engine,
-                                      catalog: encryptedCatalog, job: job)
+                    try await encrypt(roots, at: time, marker: point.marker, into: engine)
                 }
             }
             progress(pending.count, pending.count)
@@ -650,25 +882,20 @@ actor BackupRunner {
             }
         }
         if historyData { try discardHistoryData(layout, in: plaintextRoot) }
+        // Nothing plaintext left for the job root's 1.1.x catalog to list, and its markers in the repo: it goes.
+        if markersAdopted, let legacy = Self.legacyCatalog(at: jobRoot) {
+            await discardLegacyCatalogIfSpent(legacy, at: jobRoot, job: job)
+        }
     }
 
-    /// One restore point into the encrypted repo, recorded in the catalog at its original time with its
-    /// migration `marker`. A point without folders has nothing to keep.
-    private func encrypt(_ roots: [URL], at time: Date, marker: String, into engine: DedupEngine,
-                         catalog: CatalogStore, job: BackupJob) async throws {
+    /// One restore point into the encrypted repo, at its original time, with its migration `marker` as the
+    /// snapshot's origin. A point without folders has nothing to keep.
+    private func encrypt(_ roots: [URL], at time: Date, marker: String, into engine: DedupEngine) async throws {
         guard !roots.isEmpty else { return }
-        let seqId = try await catalog.beginSnapshot(jobID: job.id, timestamp: time, sourceSnapshotID: marker)
-        let encID = "enc-\(seqId)"
-        do {
-            // Re-encrypt the recorded state exactly — no exclusions.
-            let result = try await engine.backUp(sources: roots, snapshotID: encID, now: time.timeIntervalSince1970,
-                                                 exclusions: .includeEverything, toleratingVanishedEntries: false)
-            try await catalog.markComplete(seqId: seqId, dirName: encID, fileCount: result.fileCount,
-                                           logicalBytes: Int64(result.totalBytes), addedBlocks: 0, durationMs: 0)
-        } catch {
-            try? await catalog.markFailed(seqId: seqId)
-            throw error
-        }
+        // Re-encrypt the recorded state exactly — no exclusions.
+        try await engine.backUp(sources: roots, snapshotID: RepoTimeline.newSnapshotID(at: time),
+                                now: time.timeIntervalSince1970, origin: marker,
+                                exclusions: .includeEverything, toleratingVanishedEntries: false)
     }
 
     /// Remove the history engine's plaintext. The catalog goes first — into one trash folder with the
@@ -750,7 +977,7 @@ actor BackupRunner {
                                       _ body: (URL) async throws -> T) async throws -> T {
         guard inImage else { return try await body(Self.jobRoot(for: job)) }
         let lease = ImageLease.shared(for: job.destination)
-        let mount = try lease.acquire(maxSizeBytes: job.retention.maxTotalBytes, create: create)
+        let mount = try lease.acquire(create: create)
         defer { lease.release(flush: writes) }
         return try await body(Self.jobRoot(for: job, inImageAt: mount))
     }
