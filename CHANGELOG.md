@@ -24,6 +24,12 @@ All notable changes to SpectArk are documented here. The format follows
   image on the NAS, which SpectArk now keeps attached while anything uses it — a backup, the timeline,
   the restore window — and detaches a few minutes after (and before the Mac sleeps, and when you quit).
   Removing a NAS backup's data gives its space back on the NAS.
+- **A backup destination is found wherever macOS mounts it.** A NAS share remounted as
+  `/Volumes/home-1`, or a drive that comes back as "Backup 1", used to leave its backups "not
+  connected" until the job was set up again. The destination folder now carries a small hidden marker
+  (`.spectark-destination`), and SpectArk follows it to wherever the folder turns up; when it comes
+  back, backups resume on their own. A different share mounted under the same name is recognised as
+  someone else's folder and never written to.
 - **Existing backups carry over.** On the first pass the new engine starts from your newest snapshot
   (cloned, so it takes no extra space on APFS) and copies only what changed since. Your earlier
   snapshots stay on the same timeline — browsable and restorable — until the retention policy ages

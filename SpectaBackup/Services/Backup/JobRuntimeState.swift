@@ -6,7 +6,7 @@
 //  @author      Kennt Kim
 //  @company     Calida Lab
 //  @created     2026-06-29
-//  @lastUpdated 2026-09-18
+//  @lastUpdated 2026-09-19
 //
 
 import Foundation
@@ -27,6 +27,9 @@ struct JobRuntimeState: Sendable {
     var destinationFreeBytes: Int64?
     /// Total capacity of the destination volume (bytes); nil if unknown.
     var destinationTotalBytes: Int64?
+    /// The job's identified destination was last found mounted nowhere (DestinationIdentity) — whatever is
+    /// at its recorded path now.
+    var destinationMissing: Bool = false
     /// True while a plaintext→encrypted migration runs for this job.
     var isMigrating: Bool = false
     /// Migration progress; nil when not migrating.

@@ -21,6 +21,9 @@ enum BackupErrorMessage {
         if let e = error as? RepoCryptoError { return e.description }
         if let e = error as? RepoManagerError { return e.description }
         if let e = error as? BlobStoreError { return e.description }
+        if error is DestinationNotConnected {
+            return "The backup destination isn’t connected. Reconnect the drive or NAS share — SpectArk finds it wherever macOS mounts it."
+        }
         if let e = error as? SparsebundleManager.SBError {
             switch e {
             case .locked:

@@ -42,9 +42,9 @@ struct JobDetailView: View {
         .navigationTitle(job.name)
         .toolbar { ToolbarItem(placement: .primaryAction) { runButton } }
         // Re-check after history changes AND when a migration ends, so the prompt clears itself.
-        .task(id: "\(state.restorePoints.count)-\(state.isMigrating)-\(state.lastError ?? "")") {
+        .task(id: "\(state.restorePoints.count)-\(state.isMigrating)-\(state.lastError ?? "")-\(state.destinationMissing)") {
             plaintextCount = job.encryptionEnabled ? await coordinator.plaintextSnapshotCount(job.id) : 0
-            destinationOnline = DestinationStatus.isReachable(job.destination)
+            destinationOnline = !state.destinationMissing && DestinationStatus.isReachable(job.destination)
         }
     }
 
@@ -58,7 +58,7 @@ struct JobDetailView: View {
             VStack(alignment: .leading, spacing: 3) {
                 Text(isNAS ? "NAS share not connected" : "Backup destination not connected")
                     .font(.callout.weight(.semibold))
-                Text("SpectArk can’t reach \(job.destination.path). Reconnect \(isNAS ? "the NAS share" : "the drive") in Finder, then back up again.")
+                Text("SpectArk can’t find the backup folder \(job.destination.lastPathComponent). Reconnect \(isNAS ? "the NAS share" : "the drive") in Finder — wherever macOS mounts it, backups resume on their own.")
                     .font(.caption).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }

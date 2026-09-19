@@ -35,13 +35,6 @@ is a known bug — these are enhancements.
 
 ## P3 — NAS completeness
 
-- **Resolve NAS destinations by share identity, not `/Volumes` path.** macOS mounts an SMB
-  share at `/Volumes/<share>`, but on remount it may use `/Volumes/<share>-1`, `-2`, … so an
-  absolute destination path stored at setup time (e.g. `/Volumes/home-1/Backup`) breaks after
-  the share re-mounts at `/Volumes/home`. Store network destinations by their `smb://server/share`
-  identity and resolve the live mount point at backup time (match via `getmntinfo`), so remounts
-  never orphan a job. Until then, a moved destination shows the "not connected" card and must be
-  re-pointed by hand.
 - **A writer lock another Mac left behind blocks this one for good.** The image's lock records the
   writer's host UUID; a lock from another Mac is always respected, since its process cannot be checked
   from here. If that Mac crashed or lost the share mid-pass, every pass from this Mac fails as "in use by

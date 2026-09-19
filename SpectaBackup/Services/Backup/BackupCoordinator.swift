@@ -20,9 +20,17 @@
 //  - Realtime jobs get one catch-up pass at launch (changes made while SpectArk was not running), and
 //    one when they start running on changes (enabled, switched to realtime) or when what they back
 //    up changes (sources, exclusions).
+//  - Every operation on a job's backups first finds its destination (`locate`, DestinationIdentity):
+//    a share remounted at /Volumes/home-1 is followed and recorded; a destination mounted nowhere fails
+//    the operation — never falling back to whatever folder is at the old path. The job's destination
+//    fields are recorded only here; a settings edit keeps them.
+//  - When a (browsable) volume is mounted, jobs whose destination was away are found again and resume;
+//    a renamed volume re-locates every job. SpectArk's own NAS images are hidden volumes and ignored.
 //
 
+import AppKit
 import Foundation
+import os
 
 @MainActor
 @Observable
@@ -45,6 +53,12 @@ final class BackupCoordinator {
     private let launchedAt = Date()
     private var meters: [UUID: ThroughputMeter] = [:]
     private var scheduleTicker: Task<Void, Never>?
+    private var volumeObservers: [NSObjectProtocol] = []
+    private static let log = Logger(subsystem: "ai.calidalab.spectabackup", category: "destination")
+    /// Per job: the number of the latest `locate` started, and of the latest whose result was taken over —
+    /// an older one finishing late must not undo a newer one.
+    private var locatesStarted: [UUID: Int] = [:]
+    private var locatesApplied: [UUID: Int] = [:]
 
     init(usesSavedJobs: Bool = true) {
         self.usesSavedJobs = usesSavedJobs
@@ -63,7 +77,19 @@ final class BackupCoordinator {
 
     // MARK: - Job management
 
-    func addJob(_ job: BackupJob) {
+    /// Create a job: its destination folder is marked (the user just chose it — DestinationIdentity), its
+    /// encrypted repo created when `password` is given, then it is added and backed up. Returns the repo's
+    /// recovery key when one was just created (show it ONCE).
+    func createJob(_ job: BackupJob, password: String?) async throws -> String? {
+        var job = job
+        job.record(try await DestinationIdentity.identifyInBackground(newDestination: job.destination))
+        var recovery: String?
+        if let password { recovery = try await createRepo(for: job, password: password) }
+        addJob(job)
+        return recovery
+    }
+
+    private func addJob(_ job: BackupJob) {
         jobs.append(job)
         persist()
         loadHistory(for: job)
@@ -82,7 +108,17 @@ final class BackupCoordinator {
         persist()
         if deleteSnapshots, let job {
             KeychainStorage.removePassword(for: id)   // drop the encrypted repo's key too, if any
-            Task { await runner(for: job).deleteJobData(for: job) }
+            Task {
+                // Where its backups are now; a destination mounted nowhere has nothing to delete — above all
+                // not in whatever folder is at its old path.
+                let resolution = await DestinationIdentity.resolveInBackground(job)
+                var located = job
+                switch resolution {
+                case let .found(location): located.destination = location.url
+                case .notConnected: return
+                }
+                await runner(for: located).deleteJobData(for: located)
+            }
         }
     }
 
@@ -91,9 +127,15 @@ final class BackupCoordinator {
     /// pass now when it starts running on changes (changes since its last pass produced no events we
     /// saw) or when what it backs up changed — e.g. turning "Skip rebuildable files" off must back up
     /// those folders without waiting for an unrelated edit.
-    func updateJob(_ job: BackupJob) {
-        guard let idx = jobs.firstIndex(where: { $0.id == job.id }) else { return }
+    func updateJob(_ edited: BackupJob) {
+        guard let idx = jobs.firstIndex(where: { $0.id == edited.id }) else { return }
         let old = jobs[idx]
+        var job = edited
+        // Where the destination is, and which folder it is, only `locate` records: the settings sheet may
+        // hold a copy from before the destination was found elsewhere.
+        job.destination = old.destination
+        job.destinationID = old.destinationID
+        job.destinationSubpath = old.destinationSubpath
         jobs[idx] = job
         persist()
         stopWatcher(job.id)
@@ -118,6 +160,10 @@ final class BackupCoordinator {
     /// the recovery key when the repo was just created (show it ONCE), or nil if it already existed.
     /// The heavy argon2 KDF / repo creation runs off the main actor.
     func enableEncryption(for job: BackupJob, password: String) async throws -> String? {
+        try await createRepo(for: try await locate(job.id), password: password)
+    }
+
+    private func createRepo(for job: BackupJob, password: String) async throws -> String? {
         let repoRoot = BackupRunner.jobRoot(for: job).appendingPathComponent("repo", isDirectory: true)
         let pw = Data(password.utf8)
         let recovery = try await Task.detached(priority: .userInitiated) { () -> String? in
@@ -171,7 +217,6 @@ final class BackupCoordinator {
     private func execute(job: BackupJob, quietWindow: TimeInterval, requested: Bool) async {
         let jobID = job.id
         meters[jobID] = ThroughputMeter()
-        updateFreeSpace(jobID)
         let progress: @Sendable (BackupProgress) -> Void = { p in
             Task { @MainActor [weak self] in self?.applyProgress(p, for: jobID) }
         }
@@ -179,6 +224,8 @@ final class BackupCoordinator {
         let deferredCount: Int
         let succeeded: Bool
         do {
+            let job = try await locate(jobID)
+            updateFreeSpace(jobID)
             let result = try await runner(for: job).run(job: job, quietWindow: quietWindow, forceCheckpoint: requested,
                                               progress: progress)
             let history = try? await runner(for: job).history(for: job)
@@ -244,7 +291,9 @@ final class BackupCoordinator {
             Task {
                 // Drop orphaned 0-file inProgress rows left by a previous run — never a row of a pass
                 // this run has already started (the launch catch-up pass may beat this cleanup).
-                await runner(for: j).cleanupIncompleteSnapshots(for: j, startedBefore: launchedAt)
+                if let located = try? await locate(j.id) {
+                    await runner(for: located).cleanupIncompleteSnapshots(for: located, startedBefore: launchedAt)
+                }
                 loadHistory(for: j)
             }
         }
@@ -285,7 +334,8 @@ final class BackupCoordinator {
     private func loadHistory(for job: BackupJob) {
         let jobID = job.id
         Task {
-            guard let history = try? await runner(for: job).history(for: job) else { return }
+            guard let located = try? await locate(jobID),
+                  let history = try? await runner(for: located).history(for: located) else { return }
             var st = state(for: jobID)
             st.apply(history)
             states[jobID] = st
@@ -297,7 +347,7 @@ final class BackupCoordinator {
     /// Open a job's backups for the restore sheet; a NAS job's image is attached off the main actor and
     /// stays attached until `endBrowsing`.
     func beginBrowsing(_ jobID: UUID) async throws -> BackupRunner.BrowseSession {
-        guard let job = jobs.first(where: { $0.id == jobID }) else { throw CocoaError(.fileNoSuchFile) }
+        let job = try await locate(jobID)
         return try await Task.detached(priority: .userInitiated) { try BackupRunner.beginBrowsing(job: job) }.value
     }
 
@@ -315,14 +365,14 @@ final class BackupCoordinator {
     func restore(jobID: UUID, point: RestorePoint, sourceName: String,
                  relPaths: [String], to target: URL, conflict: RestoreEngine.ConflictPolicy,
                  progress: @escaping @Sendable (Int) -> Void) async throws -> RestoreEngine.Outcome {
-        guard let job = jobs.first(where: { $0.id == jobID }) else { return RestoreEngine.Outcome() }
+        let job = try await locate(jobID)
         return try await runner(for: job).restore(job: job, point: point, sourceName: sourceName,
                                         relPaths: relPaths, to: target, conflict: conflict, progress: progress)
     }
 
     /// Restore an entire encrypted snapshot into a target folder.
     func restoreEncrypted(jobID: UUID, snapshotDirName: String, to target: URL) async throws {
-        guard let job = jobs.first(where: { $0.id == jobID }) else { return }
+        let job = try await locate(jobID)
         try await runner(for: job).restoreEncrypted(job: job, snapshotID: snapshotDirName, to: target)
     }
 
@@ -330,7 +380,7 @@ final class BackupCoordinator {
 
     /// How many plaintext restore points a job still has (used to decide whether to migrate).
     func plaintextSnapshotCount(_ jobID: UUID) async -> Int {
-        guard let job = jobs.first(where: { $0.id == jobID }) else { return 0 }
+        guard let job = try? await locate(jobID) else { return 0 }   // not connected: nothing to act on now
         return await runner(for: job).plaintextSnapshotCount(for: job)
     }
 
@@ -373,6 +423,7 @@ final class BackupCoordinator {
         Task {
             var succeeded = false
             do {
+                let job = try await locate(jobID)
                 try await runner(for: job).migrateToEncrypted(job: job, progress: progress)
                 loadHistory(for: job)
                 succeeded = true
@@ -403,6 +454,7 @@ final class BackupCoordinator {
             handleChange(job.id)
         }
         startScheduleTicker()
+        startVolumeWatcher()
     }
 
     /// Periodically fire interval-triggered jobs that have come due (also catches missed runs).
@@ -455,6 +507,87 @@ final class BackupCoordinator {
         perform(schedulers[jobID, default: PassScheduler()].changeArrived(now: Date()), for: jobID)
     }
 
+    // MARK: - Destination identity
+
+    /// The job, with its destination found where it is mounted now; a destination found elsewhere, or
+    /// identified for the first time, is recorded. Throws DestinationNotConnected when it is mounted
+    /// nowhere. The search runs off the main actor: it looks at each mounted volume.
+    private func locate(_ jobID: UUID) async throws -> BackupJob {
+        guard let job = jobs.first(where: { $0.id == jobID }) else { throw CocoaError(.fileNoSuchFile) }
+        let number = locatesStarted[jobID, default: 0] + 1
+        locatesStarted[jobID] = number
+        let resolution = await DestinationIdentity.resolveInBackground(job)
+        guard let index = jobs.firstIndex(where: { $0.id == jobID }) else { throw CocoaError(.fileNoSuchFile) }
+        var current = jobs[index]
+        // A newer locate got its answer first: that one stands.
+        guard number > locatesApplied[jobID, default: 0] else {
+            if state(for: jobID).destinationMissing { throw DestinationNotConnected() }
+            return current
+        }
+        locatesApplied[jobID] = number
+        var st = state(for: jobID)
+        st.destinationMissing = resolution == .notConnected
+        states[jobID] = st
+        switch resolution {
+        case .notConnected:
+            throw DestinationNotConnected()
+        case let .found(location):
+            let before = current
+            current.record(location)
+            if current != before {
+                if current.destination != before.destination {
+                    Self.log.notice("destination of \(current.name, privacy: .public) found at \(current.destination.path, privacy: .public) (was \(before.destination.path, privacy: .public))")
+                } else if before.destinationID == nil {
+                    Self.log.notice("destination of \(current.name, privacy: .public) identified at \(current.destination.path, privacy: .public)")
+                }
+                jobs[index] = current
+                persist()
+            }
+            return current
+        }
+    }
+
+    /// Watch volumes come and go: a destination that was away may be back, or turn up at another path.
+    private func startVolumeWatcher() {
+        guard volumeObservers.isEmpty else { return }
+        let center = NSWorkspace.shared.notificationCenter
+        volumeObservers.append(center.addObserver(forName: NSWorkspace.didMountNotification, object: nil,
+                                                  queue: .main) { [weak self] note in
+            // SpectArk's own NAS images mount hidden (and come and go with every use): not a destination.
+            if let volume = note.userInfo?[NSWorkspace.volumeURLUserInfoKey] as? URL,
+               (try? volume.resourceValues(forKeys: [.volumeIsBrowsableKey]))?.volumeIsBrowsable == false { return }
+            MainActor.assumeIsolated { self?.destinationsMayHaveReturned() }
+        })
+        volumeObservers.append(center.addObserver(forName: NSWorkspace.didRenameVolumeNotification, object: nil,
+                                                  queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.relocateAll() }
+        })
+    }
+
+    /// A volume was mounted: jobs whose destination was away are looked for again, and resume.
+    private func destinationsMayHaveReturned() {
+        for job in jobs {
+            let state = state(for: job.id)
+            guard state.destinationMissing || state.lastError != nil else { continue }
+            relocate(job.id)
+        }
+    }
+
+    /// A volume was renamed: every destination on it is at another path now.
+    private func relocateAll() {
+        for job in jobs { relocate(job.id) }
+    }
+
+    private func relocate(_ jobID: UUID) {
+        Task {
+            guard let located = try? await locate(jobID) else { return }
+            updateFreeSpace(jobID)
+            loadHistory(for: located)
+            // Its last pass failed while the destination was away: back up now, not after the retry delay.
+            if Self.runsOnChanges(located), state(for: jobID).lastError != nil { handleChange(jobID) }
+        }
+    }
+
     // MARK: - Performing scheduler actions
 
     private func perform(_ action: PassScheduler.Action, for jobID: UUID) {
@@ -503,5 +636,17 @@ extension JobRuntimeState {
         restorePoints = history.points
         storageBytes = history.storageBytes
         if let last = history.lastBackup { lastBackup = max(lastBackup ?? last, last) }
+    }
+}
+
+extension BackupJob {
+    /// Take over where the destination folder was found. The recorded URL changes only when the folder is
+    /// somewhere else (not for another spelling of the same path); an identity is never cleared by a find
+    /// that could not tell it.
+    mutating func record(_ location: DestinationIdentity.Location) {
+        if destination.standardizedFileURL.path != location.url.standardizedFileURL.path { destination = location.url }
+        if let id = location.id { destinationID = id }
+        if let subpath = location.subpath { destinationSubpath = subpath }
+        if let isLocal = location.isLocal { destinationIsLocal = isLocal }
     }
 }

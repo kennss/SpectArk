@@ -7,7 +7,7 @@
 //  @author      Kennt Kim
 //  @company     Calida Lab
 //  @created     2026-06-30
-//  @lastUpdated 2026-09-18
+//  @lastUpdated 2026-09-19
 //
 
 import SwiftUI
@@ -185,28 +185,25 @@ struct NewBackupView: View {
             retention: defaults.retention,
             encryptionEnabled: encryptionEnabled)
 
-        if encryptionEnabled {
-            guard !password.isEmpty else { errorMessage = "Enter a password for encryption."; return }
-            isWorking = true
-            Task {
-                do {
-                    let recovery = try await model.coordinator.enableEncryption(for: job, password: password)
-                    isWorking = false
-                    model.coordinator.addJob(job)
-                    onCreated(job.id)
-                    if let recovery { recoveryKey = recovery }   // show once, then dismiss
-                    else { dismiss() }
-                } catch {
-                    isWorking = false
-                    errorMessage = BackupErrorMessage.describe(error)
-                }
-            }
+        if encryptionEnabled, password.isEmpty {
+            errorMessage = "Enter a password for encryption."
             return
         }
-
-        model.coordinator.addJob(job)
-        onCreated(job.id)
-        dismiss()
+        // The destination folder is marked (and an encrypted repo created) before the job is added.
+        isWorking = true
+        let repoPassword = encryptionEnabled ? password : nil
+        Task {
+            do {
+                let recovery = try await model.coordinator.createJob(job, password: repoPassword)
+                isWorking = false
+                onCreated(job.id)
+                if let recovery { recoveryKey = recovery }   // show once, then dismiss
+                else { dismiss() }
+            } catch {
+                isWorking = false
+                errorMessage = BackupErrorMessage.describe(error)
+            }
+        }
     }
 
     // MARK: - Building blocks
@@ -251,7 +248,7 @@ struct NewBackupView: View {
     private var workingOverlay: some View {
         ZStack {
             Color.black.opacity(0.2).ignoresSafeArea()
-            ProgressView("Setting up encryption…")
+            ProgressView(encryptionEnabled ? "Setting up encryption…" : "Preparing the destination…")
                 .padding(20)
                 .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10))
         }

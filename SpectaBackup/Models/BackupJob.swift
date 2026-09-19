@@ -5,11 +5,15 @@
 //  @author      Kennt Kim
 //  @company     Calida Lab
 //  @created     2026-06-29
-//  @lastUpdated 2026-09-18
+//  @lastUpdated 2026-09-19
 //
 //  Notes:
 //  - `sources`/`destination` are absolute file URLs. The app is non-sandboxed, so no security-scoped
 //    bookmarks are needed — paths are stored and used directly.
+//  - `destination` is where the destination folder was last found. `destinationID` (the ID in the folder's
+//    marker), `destinationSubpath` (its path within its volume) and `destinationIsLocal` (the kind of
+//    volume) find it again when its volume is mounted elsewhere — `/Volumes/home-1` after a remount
+//    (DestinationIdentity). All nil until identified.
 //  - TriggerMode is a Codable enum with an associated IntervalSpec; Swift synthesizes the coding.
 //  - `skipsBuildArtifacts` defaults to true, including for jobs saved before the field existed:
 //    dependency folders and build outputs are rebuildable and made up 85–95% of the entries in real
@@ -54,8 +58,15 @@ struct BackupJob: Codable, Sendable, Identifiable, Hashable {
     var name: String
     /// Absolute source folder URLs to back up.
     var sources: [URL]
-    /// Destination root (local volume path or mounted NAS share).
+    /// Destination root (local volume path or mounted NAS share), where it was last found.
     var destination: URL
+    /// The ID in the destination folder's marker file; nil until the folder is identified.
+    var destinationID: UUID?
+    /// The destination folder's path within its volume ("" = the volume itself); nil until identified.
+    var destinationSubpath: String?
+    /// The destination is on a local volume (not a network share) — only volumes of that kind are searched
+    /// for it; nil until identified.
+    var destinationIsLocal: Bool?
     var trigger: TriggerMode
     /// Relative glob patterns to exclude, in addition to the built-in excludes.
     var excludeGlobs: [String]
@@ -73,6 +84,9 @@ struct BackupJob: Codable, Sendable, Identifiable, Hashable {
          name: String,
          sources: [URL],
          destination: URL,
+         destinationID: UUID? = nil,
+         destinationSubpath: String? = nil,
+         destinationIsLocal: Bool? = nil,
          trigger: TriggerMode = .realtime,
          excludeGlobs: [String] = [],
          skipsBuildArtifacts: Bool = true,
@@ -84,6 +98,9 @@ struct BackupJob: Codable, Sendable, Identifiable, Hashable {
         self.name = name
         self.sources = sources
         self.destination = destination
+        self.destinationID = destinationID
+        self.destinationSubpath = destinationSubpath
+        self.destinationIsLocal = destinationIsLocal
         self.trigger = trigger
         self.excludeGlobs = excludeGlobs
         self.skipsBuildArtifacts = skipsBuildArtifacts
@@ -94,10 +111,11 @@ struct BackupJob: Codable, Sendable, Identifiable, Hashable {
     }
 
     // Backward-compatible decoding: `encryptionEnabled` is absent in repos created before encryption,
-    // and `skipsBuildArtifacts` in configs saved before artifact exclusion existed.
+    // `skipsBuildArtifacts` in configs saved before artifact exclusion existed, and the destination's
+    // identity in configs saved before destinations were identified.
     enum CodingKeys: String, CodingKey {
-        case id, name, sources, destination, trigger, excludeGlobs, skipsBuildArtifacts, retention, isEnabled,
-             encryptionEnabled, createdAt
+        case id, name, sources, destination, destinationID, destinationSubpath, destinationIsLocal, trigger, excludeGlobs,
+             skipsBuildArtifacts, retention, isEnabled, encryptionEnabled, createdAt
     }
 
     init(from decoder: Decoder) throws {
@@ -106,6 +124,9 @@ struct BackupJob: Codable, Sendable, Identifiable, Hashable {
         name = try c.decode(String.self, forKey: .name)
         sources = try c.decode([URL].self, forKey: .sources)
         destination = try c.decode(URL.self, forKey: .destination)
+        destinationID = try c.decodeIfPresent(UUID.self, forKey: .destinationID)
+        destinationSubpath = try c.decodeIfPresent(String.self, forKey: .destinationSubpath)
+        destinationIsLocal = try c.decodeIfPresent(Bool.self, forKey: .destinationIsLocal)
         trigger = try c.decode(TriggerMode.self, forKey: .trigger)
         excludeGlobs = try c.decode([String].self, forKey: .excludeGlobs)
         skipsBuildArtifacts = try c.decodeIfPresent(Bool.self, forKey: .skipsBuildArtifacts) ?? true

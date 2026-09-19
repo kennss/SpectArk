@@ -28,6 +28,7 @@
 //    (so the writer lock is ours): none → the image is removed; some, or unreadable → it is compacted.
 //    Read on a volume that was ejected meanwhile, the listing is no verdict; a reclaim that cannot run
 //    now stays wanted and runs when the image is next left unused.
+//  - `peek` looks inside without claiming the image (identifying a destination): read-only, no lock.
 //  - Sleep detaches idle images, skipping any lease busy attaching or compacting (the main thread never
 //    waits on it); quitting detaches everything (SparsebundleManager.detachAll, from AppDelegate).
 //
@@ -136,6 +137,19 @@ final class ImageLease: @unchecked Sendable {
         defer { lock.unlock() }
         guard armed == nil || armed == generation else { return }
         detachLocked()
+    }
+
+    /// Look inside the image without claiming it: through the attachment when one is held, else attached
+    /// read-only for the look — no writer lock, so another Mac using the image is not held up — and
+    /// detached right after. Under the lease's lock: an image attached read-only cannot be attached
+    /// read-write (measured), so nothing of this process may try meanwhile. nil when it cannot be attached.
+    func peek<T>(_ body: (URL) -> T) -> T? {
+        lock.lock()
+        defer { lock.unlock() }
+        if let current = attachment, SparsebundleManager.isAttached(current) { return body(current.mountPoint) }
+        guard let look = try? SparsebundleManager.attach(at: destination, maxSizeBytes: 0, readOnly: true) else { return nil }
+        defer { SparsebundleManager.detach(look) }
+        return body(look.mountPoint)
     }
 
     /// Wait until the reclaims requested so far have run (tests).
