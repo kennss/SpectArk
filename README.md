@@ -29,7 +29,9 @@ it works wasn't what I needed:
 
 - **I don't need a whole-system backup.** Time Machine copies the OS, apps, and
   Libraries. If my machine dies I'll just reinstall those. What I *can't* reinstall is
-  the thing that actually matters: my source code and the projects I'm working on.
+  the thing that actually matters: my source code and the projects I'm working on. It's
+  the same in any line of work — the video being edited, the photos being retouched, the
+  spreadsheet or document in progress: what can't be reinstalled is the work in hand.
 - **Scheduled backups always leave a gap.** A long interval risks losing my latest
   code; a short one still loses whatever changed in the last few minutes when Murphy's
   law strikes. Even Git only protects what I've committed — never the work *between*
