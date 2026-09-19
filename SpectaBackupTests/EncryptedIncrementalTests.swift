@@ -6,7 +6,8 @@
 //               settle pass takes it; a requested restore point is written even when nothing changed; the
 //               15-minute cadence keeps the first snapshot once spacing has elapsed, each state left alone and
 //               the newest, never a requested or migrated one; a scope lists exactly the folders FSEvents
-//               reported, those on the way, and everything under a recursive report.
+//               reported, those on the way, and everything under a recursive report; the timeline shows
+//               what the repo occupies.
 //  @author      Kennt Kim
 //  @company     Calida Lab
 //  @created     2026-09-19
@@ -107,6 +108,15 @@ final class EncryptedIncrementalTests: XCTestCase {
         XCTAssertEqual(ids.count, 2)
         let newest = try await restored(runner, try XCTUnwrap(ids.first))
         XCTAssertEqual(newest["a.txt"], "beta!")
+    }
+
+    func testTheTimelineShowsWhatTheRepoOccupies() async throws {
+        let runner = runner()
+        _ = try await runner.run(job: job) { _ in }
+        let history = try await runner.history(for: job)
+        let packs = try await LocalBackend(root: repoRoot).bytes(prefix: "data")
+        XCTAssertGreaterThan(packs, 0)
+        XCTAssertEqual(history.storageBytes, packs, "the quota gauge showed 0 for an encrypted backup")
     }
 
     func testARequestedRestorePointIsWrittenEvenWhenNothingChanged() async throws {

@@ -3,9 +3,10 @@
 //  @description Retention for the history engine. `HistoryRetention.plan` is a pure planner over one
 //               timeline — the job's legacy (1.1.x) snapshots, then its checkpoints: which restore points
 //               the policy drops (the same thinning as before — "Automatic" is Time Machine style), then
-//               the oldest survivors dropped while space is short or the quota is exceeded, and which
-//               stored versions no kept checkpoint needs any more. `HistoryMaintenance` applies a plan to
-//               the catalog and versions/ and hands back the legacy snapshots to delete.
+//               the oldest survivors dropped while the quota is exceeded — and as many more as a disk short
+//               of space asks for (DiskSpace; `ladder` tells it what each would free) — and which stored
+//               versions no kept checkpoint needs any more. `HistoryMaintenance` applies a plan to the
+//               catalog and versions/ and hands back the legacy snapshots to delete.
 //               Design: docs/INCREMENTAL_ENGINE_DESIGN.md §3.6.
 //  @author      Kennt Kim
 //  @company     Calida Lab
@@ -16,12 +17,14 @@
 //  - The newest restore point is never dropped, and current/ is never touched: retention only removes
 //    history. A version is needed while some kept checkpoint lies in its [born, died).
 //  - Policies: Automatic (Time Machine: everything from the last 24 h, the newest per day for 30 days,
-//    the newest per week after), keep the newest N, keep N days, keep all; then free-space and quota
-//    pressure. Days (and weeks) are local and begin at 05:00, so a night of work counts toward the day it
-//    began. Free space comes from statfs; a legacy snapshot's size is its own written blocks.
+//    the newest per week after), keep the newest N, keep N days, keep all; then the quota. Days (and
+//    weeks) are local and begin at 05:00, so a night of work counts toward the day it began. A legacy
+//    snapshot's size is its own written blocks.
 //  - One timeline, so a policy means what the user sees: "keep 10" keeps the ten newest restore points
-//    whether they are checkpoints or snapshots from before the migration; space pressure drops the
-//    oldest first, which are the legacy snapshots.
+//    whether they are checkpoints or snapshots from before the migration; the quota and space pressure
+//    drop the oldest first, which are the legacy snapshots.
+//  - Free space is not a per-job rule: the disk keeps its reserve across all its jobs (DiskSpace), and asks
+//    each for its oldest restore points by count (`pressureDrops`), in the order `ladder` described.
 //  - Space accounting uses logical sizes: current/ plus the versions still needed. Dropping the oldest
 //    kept checkpoint frees exactly the versions that contained it but not the next kept one.
 //  - Order on disk: catalog rows first (one commit, with `sweep_pending` set), then version files. An
@@ -72,44 +75,94 @@ enum HistoryRetention {
         }
     }
 
+    /// What the policy and the quota drop — and, for a disk short of space (DiskSpace), `pressureDrops` more
+    /// of the oldest restore points left — and which versions nothing kept needs any more.
     static func plan(policy: RetentionPolicy,
                      checkpoints: [HistoryCheckpoint],
                      versions: [VersionSpan],
                      currentBytes: Int64,
                      seededBytes: Int64 = 0,
                      legacy: [LegacySnapshot] = [],
-                     freeBytes: Int64,
+                     pressureDrops: Int = 0,
                      now: Date,
                      calendar: Calendar = .autoupdatingCurrent) -> Plan {
-        let timeline: [Point] = legacy.sorted { $0.id < $1.id }.map(Point.legacy)
-            + checkpoints.sorted { $0.seq < $1.seq }.map(Point.checkpoint)
-        guard !timeline.isEmpty else {
+        guard var thinning = Thinning(policy: policy, checkpoints: checkpoints, versions: versions,
+                                      currentBytes: currentBytes, seededBytes: seededBytes, legacy: legacy,
+                                      now: now, calendar: calendar) else {
             return Plan(versions: Set(versions.map(\.id)))   // nothing can reach them
         }
+        for _ in 0..<max(0, pressureDrops) {
+            guard thinning.dropOldest() != nil else { break }
+        }
+        return thinning.plan(versions: versions)
+    }
 
-        // 1) Age/count policy over the whole timeline (positions are its order) — never the newest.
-        var dropped = thinned(by: policy.mode,
+    /// What dropping each of the oldest restore points the policy and the quota leave would free, oldest
+    /// first — never the newest (DiskSpace.Ladder). `plan` with `pressureDrops: n` drops the first n.
+    static func ladder(policy: RetentionPolicy,
+                       checkpoints: [HistoryCheckpoint],
+                       versions: [VersionSpan],
+                       currentBytes: Int64,
+                       seededBytes: Int64 = 0,
+                       legacy: [LegacySnapshot] = [],
+                       now: Date,
+                       calendar: Calendar = .autoupdatingCurrent) -> [DiskSpace.Step] {
+        guard var thinning = Thinning(policy: policy, checkpoints: checkpoints, versions: versions,
+                                      currentBytes: currentBytes, seededBytes: seededBytes, legacy: legacy,
+                                      now: now, calendar: calendar) else { return [] }
+        var steps: [DiskSpace.Step] = []
+        while let step = thinning.dropOldest() { steps.append(step) }
+        return steps
+    }
+
+    /// One timeline being thinned: the policy first (at init), then the quota, then — one by one — the
+    /// oldest kept restore point, each time accounting for what that frees.
+    private struct Thinning {
+        let timeline: [Point]
+        var dropped: Set<Int64>
+        /// Timeline positions kept, ascending.
+        var kept: [Int]
+        /// Versions some kept checkpoint still needs.
+        var needed: [VersionSpan]
+        var keptLegacy: Int
+        /// Bytes the kept history occupies (for the quota): current/, needed versions, kept legacy snapshots.
+        var usage: Int64
+        let seededBytes: Int64
+
+        /// nil when the timeline is empty.
+        init?(policy: RetentionPolicy, checkpoints: [HistoryCheckpoint], versions: [VersionSpan],
+              currentBytes: Int64, seededBytes: Int64, legacy: [LegacySnapshot], now: Date, calendar: Calendar) {
+            timeline = legacy.sorted { $0.id < $1.id }.map(Point.legacy)
+                + checkpoints.sorted { $0.seq < $1.seq }.map(Point.checkpoint)
+            guard !timeline.isEmpty else { return nil }
+            self.seededBytes = seededBytes
+
+            // 1) Age/count policy over the whole timeline (positions are its order) — never the newest.
+            dropped = HistoryRetention.thinned(by: policy.mode,
                               items: timeline.enumerated().map { .init(id: Int64($0.offset), time: $0.element.time) },
                               now: now, calendar: calendar)
-        dropped.remove(Int64(timeline.count - 1))
-        var kept = timeline.indices.filter { !dropped.contains(Int64($0)) }   // ascending
+            dropped.remove(Int64(timeline.count - 1))
+            let kept = timeline.indices.filter { [dropped] in !dropped.contains(Int64($0)) }
+            self.kept = kept
+            let keptSeqs = kept.compactMap { [timeline] in
+                if case let .checkpoint(c) = timeline[$0] { return c.seq } else { return nil }
+            }
+            needed = versions.filter { HistoryRetention.isNeeded($0, kept: keptSeqs) }
+            // Seeded items are clones of legacy data: their blocks are counted with the legacy snapshots
+            // while any is kept, and with current/ once the last one goes.
+            keptLegacy = kept.filter { [timeline] in if case .legacy = timeline[$0] { return true } else { return false } }.count
+            usage = currentBytes - (keptLegacy > 0 ? seededBytes : 0) + needed.reduce(Int64(0)) { $0 + $1.size }
+                + kept.reduce(Int64(0)) { [timeline] in
+                    if case let .legacy(s) = timeline[$1] { return $0 + s.bytes } else { return $0 }
+                }
 
-        func keptCheckpoints() -> [Int64] {
-            kept.compactMap { if case let .checkpoint(c) = timeline[$0] { return c.seq } else { return nil } }
+            // 2) Quota — the oldest kept restore points go until the history fits.
+            while policy.maxTotalBytes > 0, usage > policy.maxTotalBytes, dropOldest() != nil {}
         }
-        var needed = versions.filter { isNeeded($0, kept: keptCheckpoints()) }
-        var liveFree = freeBytes
-        // Seeded items are clones of legacy data: their blocks are counted with the legacy snapshots
-        // while any is kept, and with current/ once the last one goes.
-        var keptLegacy = kept.filter { if case .legacy = timeline[$0] { return true } else { return false } }.count
-        var usage = currentBytes - (keptLegacy > 0 ? seededBytes : 0) + needed.reduce(Int64(0)) { $0 + $1.size }
-            + kept.reduce(Int64(0)) { if case let .legacy(s) = timeline[$1] { return $0 + s.bytes } else { return $0 } }
 
-        // 2) Space pressure and quota — drop the oldest kept restore points until satisfied.
-        while kept.count > 1 {
-            let lowFree = policy.minimumFreeBytes > 0 && liveFree < policy.minimumFreeBytes
-            let overQuota = policy.maxTotalBytes > 0 && usage > policy.maxTotalBytes
-            guard lowFree || overQuota else { break }
+        /// Drop the oldest kept restore point — never the last one — and say what that frees.
+        mutating func dropOldest() -> DiskSpace.Step? {
+            guard kept.count > 1 else { return nil }
             let oldest = kept.removeFirst()
             dropped.insert(Int64(oldest))
             let freedBytes: Int64
@@ -127,26 +180,31 @@ enum HistoryRetention {
                 }
             case let .checkpoint(checkpoint):
                 // Legacy snapshots precede every checkpoint, so the next kept point is a checkpoint.
-                guard case let .checkpoint(next) = timeline[kept[0]] else { continue }
-                // Versions containing `checkpoint` but not `next` are no longer needed by anything kept.
-                let freed = needed.filter { $0.born <= checkpoint.seq && checkpoint.seq < $0.died && $0.died <= next.seq }
-                let freedIDs = Set(freed.map(\.id))
-                needed.removeAll { freedIDs.contains($0.id) }
-                freedBytes = freed.reduce(Int64(0)) { $0 + $1.size }
+                if case let .checkpoint(next) = timeline[kept[0]] {
+                    // Versions containing `checkpoint` but not `next` are no longer needed by anything kept.
+                    let freed = needed.filter { $0.born <= checkpoint.seq && checkpoint.seq < $0.died && $0.died <= next.seq }
+                    let freedIDs = Set(freed.map(\.id))
+                    needed.removeAll { freedIDs.contains($0.id) }
+                    freedBytes = freed.reduce(Int64(0)) { $0 + $1.size }
+                } else {
+                    freedBytes = 0
+                }
             }
-            liveFree = liveFree > Int64.max - freedBytes ? Int64.max : liveFree + freedBytes   // saturating
             usage -= freedBytes
+            return DiskSpace.Step(time: timeline[oldest].time, freed: freedBytes)
         }
 
-        var plan = Plan()
-        for position in dropped {
-            switch timeline[Int(position)] {
-            case let .legacy(snapshot): plan.legacySnapshots.insert(snapshot.id)
-            case let .checkpoint(checkpoint): plan.checkpoints.insert(checkpoint.seq)
+        func plan(versions: [VersionSpan]) -> Plan {
+            var plan = Plan()
+            for position in dropped {
+                switch timeline[Int(position)] {
+                case let .legacy(snapshot): plan.legacySnapshots.insert(snapshot.id)
+                case let .checkpoint(checkpoint): plan.checkpoints.insert(checkpoint.seq)
+                }
             }
+            plan.versions = Set(versions.map(\.id)).subtracting(needed.map(\.id))
+            return plan
         }
-        plan.versions = Set(versions.map(\.id)).subtracting(needed.map(\.id))
-        return plan
     }
 
     // MARK: - Policy thinning
@@ -244,9 +302,15 @@ struct HistoryMaintenance: Sendable {
 
     let layout: HistoryLayout
 
+    /// Apply the policy and the quota — and `pressureDrops` more of the oldest restore points (DiskSpace) —
+    /// to the job's timeline. A job whose history has no catalog (only legacy snapshots) has only those.
     func applyRetention(policy: RetentionPolicy, legacy: [HistoryRetention.LegacySnapshot] = [],
-                        freeBytes: Int64, now: Date) throws -> Result {
-        let store = try HistoryStore(path: layout.catalogPath)
+                        pressureDrops: Int = 0, now: Date) throws -> Result {
+        guard let store = try openStore() else {
+            let plan = HistoryRetention.plan(policy: policy, checkpoints: [], versions: [], currentBytes: 0,
+                                             legacy: legacy, pressureDrops: pressureDrops, now: now)
+            return Result(legacySnapshotsToDelete: plan.legacySnapshots)
+        }
         guard try store.pendingIntents().isEmpty else { return Result(skippedForPendingIntents: true) }
         if try store.sweepPending() { try sweep(store) }   // an earlier prune was interrupted
 
@@ -258,7 +322,7 @@ struct HistoryMaintenance: Sendable {
             currentBytes: try store.currentBytes(),
             seededBytes: try store.seededBytes(),
             legacy: legacy,
-            freeBytes: freeBytes,
+            pressureDrops: pressureDrops,
             now: now)
         guard !plan.checkpoints.isEmpty || !plan.versions.isEmpty else {
             return Result(legacySnapshotsToDelete: plan.legacySnapshots)
@@ -273,6 +337,32 @@ struct HistoryMaintenance: Sendable {
         return Result(checkpointsDeleted: plan.checkpoints.count, versionsDeleted: doomed.count,
                       bytesFreed: doomed.reduce(Int64(0)) { $0 + $1.size },
                       legacySnapshotsToDelete: plan.legacySnapshots)
+    }
+
+    /// What dropping each of the oldest restore points the policy and the quota leave would free, oldest first
+    /// (HistoryRetention.ladder). nil while an interrupted pass has unsettled intents: what they moved is not
+    /// accounted for yet.
+    func ladder(policy: RetentionPolicy, legacy: [HistoryRetention.LegacySnapshot] = [],
+                now: Date) throws -> [DiskSpace.Step]? {
+        guard let store = try openStore() else {
+            return HistoryRetention.ladder(policy: policy, checkpoints: [], versions: [], currentBytes: 0,
+                                           legacy: legacy, now: now)
+        }
+        guard try store.pendingIntents().isEmpty else { return nil }
+        return HistoryRetention.ladder(
+            policy: policy,
+            checkpoints: try store.checkpoints(),
+            versions: try store.versions().map { .init(id: $0.id, born: $0.born, died: $0.died, size: $0.size) },
+            currentBytes: try store.currentBytes(),
+            seededBytes: try store.seededBytes(),
+            legacy: legacy,
+            now: now)
+    }
+
+    /// The job's history catalog; nil when it has none (never created here).
+    private func openStore() throws -> HistoryStore? {
+        guard try Syscalls.exists(layout.catalogPath) else { return nil }
+        return try HistoryStore(path: layout.catalogPath)
     }
 
     /// Delete files in versions/ that no version row references.

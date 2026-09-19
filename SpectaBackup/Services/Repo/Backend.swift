@@ -36,6 +36,8 @@ protocol Backend: Sendable {
     /// Read-your-writes existence/size by key — this is the trustworthy "exists", not list().
     func stat(key: String) async throws -> BackendStat?
     func list(prefix: String) async throws -> [String]
+    /// What the objects under `prefix` occupy, in bytes (their sizes, as `stat` gives them).
+    func bytes(prefix: String) async throws -> Int64
     func delete(key: String) async throws
     /// Make every object put so far durable (a write barrier): what is written after it — a snapshot, the
     /// commit point — can never survive a crash without what it refers to.

@@ -140,9 +140,41 @@ batch, not per file.
   for 30 days, the newest per week after that. Days and weeks are local and begin at 05:00 on the wall
   clock (decided 2026-09-19; daylight saving does not move it): a night of work belongs to the day it
   began, instead of splitting at midnight — or, as 1.1.x did, at UTC midnight, which fell mid-morning in
-  Asia. Moving to another time zone re-buckets older restore points by the new local days; the existing space rules (minimum free space, quota)
-  drop the oldest first. The newest checkpoint and `current/` are never pruned.
+  Asia. Moving to another time zone re-buckets older restore points by the new local days. A job's quota
+  drops its oldest first. The newest checkpoint and `current/` are never pruned.
 - A version is deleted when no kept checkpoint lies in its `[born, died)`.
+- Free space is the disk's, not a job's (DiskSpace, decided 2026-09-19): every backup disk keeps a reserve
+  free — 5% of it, or the largest "Keep free space" a job there sets. Before and after every pass, a disk
+  with less free loses its oldest restore points across all its jobs, oldest first, whichever job they
+  belong to (Time Machine deletes its oldest backups the same way), until the reserve is back; each job's
+  newest is kept, and "Keep all" jobs give up nothing unless they set a free-space value themselves. Each
+  job offers a ladder — what dropping each of its oldest restore points would free, after its own policy
+  and quota — and the disk takes steps from all ladders in time order; an encrypted repo's garbage counts
+  first (collecting it costs no restore point). All jobs on one disk share one runner, so this never runs
+  beside another job's pass there.
+- A pass that runs out of room (ENOSPC, or SQLITE_FULL from its catalog) stops with what it still has to
+  write; its last batch is settled, room is made for that plus the reserve, and it goes on from where it
+  stopped (earlier batches stay done). It fails as a full disk only when nothing more may go. A pass that
+  never finished is never sealed as an earlier state (`pass_open`, set before the first batch, cleared by
+  `finishPass`). An encrypted pass's packs are kept whole meanwhile, so its retry reuses them.
+- A batch is begun only if its writes fit in the disk's free space less a headroom (the ballast's size) —
+  for a NAS image, the share's free space. This comes before any error because a full share never fails a
+  write into an image: measured, 600 MB written into an image on a 300 MB volume all "succeeded" (fsync
+  too), and the file was gone once the image was attached again (APFS fell back to its last whole
+  checkpoint). A batch that does not fit stops the pass as out of space, like ENOSPC.
+- Making room takes room: on a really full disk SQLite cannot even open a catalog (measured: SQLITE_FULL
+  with 5 MB reported free on a small APFS volume, whose last few MB take only small writes; on a fuller one,
+  SQLITE_IOERR_SHMOPEN with no errno — its -shm file cannot be created). So each
+  destination keeps a ballast (`SpectaBackup/.space-reserve`, 64 MB or half the reserve), counted as free,
+  removed first whenever room must be made, and put back once the reserve is. A disk that filled before it
+  had a ballast — its catalogs failing to open with less than a ballast's worth free — is reported as too
+  full even to make room (free a little by hand), not as having nothing left to remove. A NAS image that
+  lost restore points is compacted at once, so the share has the room back before anything is measured
+  again. Quit and sleep cancel a compaction under way (`hdiutil compact` cancels cleanly on SIGINT —
+  measured at several points: the container checks out, every file reads back) and wait for its lock to be
+  released, so no `hdiutil` outlives the app holding an image nothing locks.
+- An encrypted job's footprint (the quota gauge) is its repo's pack bytes, measured when a pass or a space
+  reclamation ends and kept in its RepoTimeline cache, so showing it lists nothing at the destination.
 
 ### 3.7 Change discovery (FSEvents journal)
 
@@ -292,8 +324,8 @@ Per job, on the first pass of the new engine (`HistorySeeder`, then a normal pas
    Checkpoint 1 is sealed by the first pass that changes something (or by Back Up Now after a change).
 4. Legacy snapshot trees are no longer written. They stay browsable and restorable in the app and share
    one timeline with the checkpoints: the retention policy thins legacy snapshots and checkpoints
-   together ("keep 10" keeps the ten newest restore points of either kind), space pressure drops the
-   oldest first — the legacy ones — and the newest restore point is always kept. `.inprogress-*`
+   together ("keep 10" keeps the ten newest restore points of either kind), the quota and the disk's
+   space pressure drop the oldest first — the legacy ones — and the newest restore point is always kept. `.inprogress-*`
    partials of the old engine are discarded.
 5. A dropped legacy snapshot is renamed to `.deleting-<name>`, then its row is deleted, then the tree —
    in the background on local destinations (TreeReaper, background QoS; retention counts what it is

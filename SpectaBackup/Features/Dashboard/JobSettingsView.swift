@@ -7,7 +7,7 @@
 //  @author      Kennt Kim
 //  @company     Calida Lab
 //  @created     2026-06-29
-//  @lastUpdated 2026-09-18
+//  @lastUpdated 2026-09-19
 //
 //  Notes:
 //  - Sizes are entered in GB (decimal, 1 GB = 1,000,000,000 bytes); 0 means "no limit".
@@ -178,9 +178,9 @@ struct JobSettingsView: View {
             section("Storage limits") {
                 numberRow("Max backup size", hint: "0 = unlimited", value: $quotaGB)
                 rowDivider
-                numberRow("Keep free space", hint: "0 = off", value: $minFreeGB)
+                numberRow("Keep free space", hint: "0 = automatic (5% of the disk)", value: $minFreeGB)
             }
-            Text("When a limit is reached, the oldest restore points are deleted first — useful for a NAS share allowance.")
+            Text("When a limit is reached, the oldest restore points are deleted first — for free space, those of every backup on the disk, oldest first. Keep all never deletes for space unless you set free space here.")
                 .font(.caption).foregroundStyle(.secondary).padding(.horizontal, 4)
         }
     }

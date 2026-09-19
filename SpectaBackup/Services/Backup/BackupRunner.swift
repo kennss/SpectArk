@@ -11,8 +11,8 @@
 //  @lastUpdated 2026-09-19
 //
 //  Notes:
-//  - One runner per destination (BackupCoordinator): jobs on one disk or NAS image take turns, jobs on
-//    different destinations run side by side. The heavy capture loop is synchronous, so it holds its
+//  - One runner per disk (BackupCoordinator, DiskSpace.diskKey): jobs on one disk take turns, jobs on
+//    different disks run side by side. The heavy capture loop is synchronous, so it holds its
 //    runner for the duration — what HistoryReader/HistoryMaterializer rely on: nothing moves a file in
 //    current/ while they read. The scheduler keeps a job's own passes and migration from overlapping.
 //  - Legacy (1.1.x) snapshot trees are no longer written. They stay browsable and restorable, are thinned
@@ -29,11 +29,18 @@
 //    one, for its first pass) — read from disk, so passes and reads always agree on where its backups are.
 //  - Deleting inside an image frees nothing on the share: removing a job's backups (or migrating them into
 //    the encrypted repo) removes the image when no other job's backups are in it, or compacts it.
+//  - Disk space (keepDiskReserve, DiskSpace): before and after every pass, a disk with less than its reserve
+//    free (5%, or the largest "Keep free space" of its jobs) loses its oldest restore points — of all its
+//    jobs together, oldest first — until the reserve is back. A pass that runs out of room is settled, room
+//    is made for what it still has to write, and it goes on from where it stopped; it fails only when
+//    nothing more may be removed (DiskFullError). An encrypted pass's packs are kept meanwhile, so the
+//    retry reuses them. Per-job retention (policy, quota) runs after each pass as before.
 //
 
 import Darwin
 import Foundation
 import os
+import Security
 
 enum EncryptedBackupError: Error, CustomStringConvertible {
     case passwordMissing
@@ -60,6 +67,9 @@ actor BackupRunner {
     /// Unlocked repo keys by repo path, with the identity of the repo they unlock (RepoTimeline.identity):
     /// the KDF runs once per repo while the app runs, and a repo created anew at the path is unlocked anew.
     private var unlocked: [String: (repo: String, config: RepoConfig, keys: RepoKeys)] = [:]
+    /// Per job: packs an encrypted pass that ran out of room wrote — kept whole while room is made for the
+    /// pass to be tried again, so what it stored is reused (RepoMaintenance `protecting`).
+    private var unfinishedPacks: [UUID: Set<String>] = [:]
 
     init(passwords: @escaping @Sendable (UUID) -> String? = { KeychainStorage.password(for: $0) },
          timeline: RepoTimeline = RepoTimeline()) {
@@ -103,14 +113,44 @@ actor BackupRunner {
     /// schedule, a new job) and ends with a checkpoint — an explicit restore point.
     /// `journalHints`: per source name, a later cursor its journal replay may start from (the coordinator
     /// vouches that nothing relevant happened since the stored one — JournalCursor.advanced).
+    /// `neighbors`: the other jobs backing up to the same disk — the disk's reserve is kept across all of
+    /// them (keepDiskReserve), before the pass, after it, and whenever it runs out of room.
     func run(job: BackupJob,
+             neighbors: [BackupJob] = [],
              quietWindow: TimeInterval = 0,
              forceCheckpoint: Bool = false,
              journalHints: [String: JournalHint] = [:],
              progress: @escaping @Sendable (BackupProgress) -> Void) async throws -> PassResult {
         try await exclusively {
-            try await runPass(job: job, quietWindow: quietWindow, forceCheckpoint: forceCheckpoint,
-                              journalHints: journalHints, progress: progress)
+            let disk = [job] + neighbors.filter { $0.id != job.id }
+            let before = await keepDiskReserve(for: job, jobs: disk)
+            // Too full to open its catalogs: the pass could not open its own either.
+            if before.blocked, !before.madeRoom { throw DiskFullError(tooFullToMakeRoom: true) }
+            var result: PassResult
+            while true {
+                do {
+                    result = try await runPass(job: job, quietWindow: quietWindow, forceCheckpoint: forceCheckpoint,
+                                               journalHints: journalHints, progress: progress)
+                    break
+                } catch where DiskSpace.isOutOfSpace(error) {
+                    // The disk ran out of room: the oldest restore points make it — enough for what the pass
+                    // still has to write, where it can tell — and the pass goes on from where it stopped. Each
+                    // round removes something, so this ends: with the pass done, or nothing left to remove.
+                    var needed: Int64 = 0
+                    if case let CaptureError.outOfSpace(bytes) = error { needed = bytes }
+                    let made = await keepDiskReserve(for: job, jobs: disk, needing: needed)
+                    guard made.madeRoom else {
+                        if made.blocked { throw DiskFullError(tooFullToMakeRoom: true) }
+                        if made.short { throw DiskFullError() }
+                        throw error
+                    }
+                }
+            }
+            unfinishedPacks[job.id] = nil
+            let after = await keepDiskReserve(for: job, jobs: disk)
+            let warnings = [result.warning, after.warning].compactMap { $0 }
+            result.warning = warnings.isEmpty ? nil : warnings.joined(separator: " ")
+            return result
         }
     }
 
@@ -153,6 +193,7 @@ actor BackupRunner {
         let outcome = try CaptureEngine(layout: layout).runPass(job: job, quietWindow: quietWindow,
                                                                 forceCheckpoint: forceCheckpoint,
                                                                 journalHints: journalHints,
+                                                                room: Self.room(for: job, jobRoot: jobRoot, inImage: inImage),
                                                                 progress: progress)
         // Inside a NAS image, dropped trees must be gone before it is detached; elsewhere they go in the
         // background (TreeReaper) so their deletion holds up no pass.
@@ -194,14 +235,14 @@ actor BackupRunner {
                                              now: now.timeIntervalSince1970, requested: forceCheckpoint,
                                              incremental: plan.incremental, exclusions: BackupExclusions(job: job),
                                              toleratingVanishedEntries: true)
-        } catch {
-            // A pass that failed — the disk full, say — still gets its retention: space pressure collects at
-            // once, so the next pass can succeed.
-            _ = await applyEncryptedRetention(job: job, repo: backend, keys: keys)
+        } catch where DiskSpace.isOutOfSpace(error) {
+            // What it stored stays while room is made (not collected as garbage): the pass tried again reuses it.
+            unfinishedPacks[job.id, default: []].formUnion(await engine.packsWritten())
             throw error
         }
         let finished = Date()
         let warning = await applyEncryptedRetention(job: job, repo: backend, keys: keys)
+        await recordStoredBytes(of: job, in: backend)
         // The next pass starts from the snapshot that holds this state, and from where the journal was read up to.
         timeline.recordCapture(job.id, EncryptedCaptureState(
             parent: result.snapshotID, fingerprint: plan.fingerprint, cursors: plan.cursors, carried: result.carried,
@@ -284,9 +325,8 @@ actor BackupRunner {
         let now = Date()
         do {
             let listing = try await timeline.listing(jobID: job.id, backend: repo, keys: keys)
-            let free = (try? Syscalls.volumeInfo(at: repo.root.path))?.freeBytes ?? Int64.max
             let outcome = try await RepoMaintenance(backend: repo, keys: keys).run(
-                policy: job.retention, snapshots: listing.snapshots, freeBytes: free,
+                policy: job.retention, snapshots: listing.snapshots,
                 collect: timeline.collectionDue(job.id, now: now), now: now)
             if outcome.collected { timeline.recordCollection(job.id, at: now) }
             let unreadable = Set(listing.unreadable).union(outcome.unreadable)
@@ -303,6 +343,14 @@ actor BackupRunner {
     }
 
     // MARK: - Encrypted repo
+
+    /// Measure and remember what the job's repo occupies — its packs — for the timeline's footprint, so
+    /// showing it lists nothing at the destination.
+    private func recordStoredBytes(of job: BackupJob, in backend: Backend) async {
+        guard let repo = try? await RepoTimeline.identity(of: backend),
+              let bytes = try? await backend.bytes(prefix: "data") else { return }
+        timeline.recordStoredBytes(job.id, repo: repo, bytes)
+    }
 
     /// The job's encrypted repo, when it has one (never created here: that is Settings' job, where the
     /// recovery key can be shown).
@@ -379,26 +427,32 @@ actor BackupRunner {
 
     // MARK: - Retention
 
-    /// Thin the job's timeline — legacy snapshots, then checkpoints — with its policy, measuring free
-    /// space on the volume that holds the backups (the sparsebundle's own volume when applicable).
+    /// Thin the job's timeline — legacy snapshots, then checkpoints — with its policy and quota; free space is
+    /// the disk's concern (keepDiskReserve). `pressureDrops`: that many more of its oldest restore points go.
+    /// Returns whether anything went.
+    @discardableResult
     private func applyRetention(job: BackupJob, layout: HistoryLayout, jobRoot: URL, legacy: CatalogStore?,
-                                reapInBackground: Bool) async {
+                                reapInBackground: Bool, pressureDrops: Int = 0, now: Date = Date()) async -> Bool {
         let snapshotsDir = jobRoot.appendingPathComponent("snapshots", isDirectory: true)
         if let legacy {
             await reconcileLegacyTrees(in: snapshotsDir, job: job, legacy: legacy, reapInBackground: reapInBackground)
         }
         let snapshots = ((try? await legacy?.snapshots(jobID: job.id)) ?? []).filter(Self.isPlaintext)
-        // Space the reaper is still freeing counts as free, or a free-space rule would drop restore point
-        // after restore point for bytes already on their way back.
-        let reaping = reapInBackground ? TreeReaper.shared.pendingBytes(under: jobRoot.path) : 0
-        let free = (try? Syscalls.volumeInfo(at: jobRoot.path)).map { $0.freeBytes + reaping } ?? Int64.max
         guard let result = try? HistoryMaintenance(layout: layout).applyRetention(
-            policy: job.retention,
-            legacy: snapshots.map { .init(id: $0.seqId, time: $0.timestamp, bytes: $0.addedBlocks * 512) },
-            freeBytes: free, now: Date()), let legacy else { return }
+            policy: job.retention, legacy: Self.legacyPoints(snapshots), pressureDrops: pressureDrops, now: now)
+        else { return false }
+        var removed = result.checkpointsDeleted > 0 || result.versionsDeleted > 0
+        guard let legacy else { return removed }
         for snapshot in snapshots where result.legacySnapshotsToDelete.contains(snapshot.seqId) {
             await deleteLegacySnapshot(snapshot, in: snapshotsDir, legacy: legacy, reapInBackground: reapInBackground)
+            removed = true
         }
+        return removed
+    }
+
+    /// Legacy snapshots as retention sees them: their own footprint is their freshly written blocks.
+    private static func legacyPoints(_ snapshots: [SnapshotRecord]) -> [HistoryRetention.LegacySnapshot] {
+        snapshots.map { .init(id: $0.seqId, time: $0.timestamp, bytes: $0.addedBlocks * 512) }
     }
 
     private static let deletingPrefix = ".deleting-"
@@ -525,6 +579,217 @@ actor BackupRunner {
         lease.release(flush: true)
     }
 
+    // MARK: - Disk space
+
+    private static let spaceLog = Logger(subsystem: "ai.calidalab.spectabackup", category: "space")
+
+    /// What `keepDiskReserve` did.
+    struct Reclaim: Sendable {
+        /// Restore points were removed, or garbage collected: a pass that ran out of room may be tried again.
+        var madeRoom = false
+        /// Less than the target is free even with everything that may go gone.
+        var short = false
+        /// Some backups there could not even be opened for lack of room: what they hold is not counted.
+        var blocked = false
+        /// What the user should know: the disk stays short.
+        var warning: String? {
+            guard short else { return nil }
+            return blocked
+                ? "The backup disk is too full even to remove old restore points. Free up a little space on it (100 MB is enough)."
+                : "The backup disk is almost full, and no older restore points can be removed to make room."
+        }
+    }
+
+    /// One job's backups, opened to make room on its disk.
+    private struct SpaceSide {
+        enum Store {
+            case history(layout: HistoryLayout, jobRoot: URL, legacy: CatalogStore?, snapshots: [SnapshotRecord],
+                         lease: ImageLease?)
+            case encrypted(maintenance: RepoMaintenance, snapshots: [RepoSnapshotSummary],
+                           survey: RepoMaintenance.Survey, protected: Set<String>)
+        }
+        let job: BackupJob
+        let store: Store
+        var ladder: DiskSpace.Ladder
+    }
+
+    /// Keep the reserve free on the disk `job`'s backups are on (DiskSpace): while less than it — plus
+    /// `extra`, what a pass that ran out of room still has to write — is free, the oldest restore points go,
+    /// of every job in `jobs` (those on the disk, `job` included) together, oldest first, and encrypted repos
+    /// collect their garbage. A NAS image that lost restore points is compacted at once, so the share has the
+    /// room back before anything is measured or written again. Nothing is opened while enough is free.
+    func keepDiskReserve(for job: BackupJob, jobs: [BackupJob], needing extra: Int64 = 0) async -> Reclaim {
+        guard let volume = try? Syscalls.volumeInfo(at: job.destination.path) else { return Reclaim() }
+        let reserve = DiskSpace.reserve(capacity: volume.totalBytes, jobs: jobs)
+        let target = DiskSpace.saturatingAdd(reserve, max(0, extra))
+        // Space the reaper is still freeing counts as free: it is on its way back. So does the ballast: it is
+        // there to be given back.
+        func reaping() -> Int64 {
+            jobs.reduce(Int64(0)) { $0 + TreeReaper.shared.pendingBytes(under: Self.jobRoot(for: $1).path) }
+        }
+        let ballasts = Set(jobs.map { Self.ballastURL(for: $0.destination).standardizedFileURL })
+        let set = ballasts.reduce(Int64(0)) { $0 + Self.size(of: $1) }
+        let free = DiskSpace.saturatingAdd(DiskSpace.saturatingAdd(volume.freeBytes, reaping()), set)
+        guard free < target else {
+            Self.placeBallast(for: job.destination, bytes: DiskSpace.ballastBytes(reserve: reserve))
+            return Reclaim()
+        }
+        // Room to make room: a full disk cannot even open a catalog.
+        for ballast in ballasts { try? FileManager.default.removeItem(at: ballast) }
+        // Less than a ballast's worth to work with: what cannot be opened now is taken for the disk being full
+        // (SQLite says so only sometimes — measured: SQLITE_IOERR_SHMOPEN, no errno, on a full APFS volume).
+        let cramped = ((try? Syscalls.volumeInfo(at: job.destination.path))?.freeBytes ?? 0)
+            < DiskSpace.ballastBytes(reserve: reserve)
+
+        let now = Date()
+        var sides: [SpaceSide] = []
+        var blocked = false
+        for candidate in jobs where DiskSpace.givesUpSpace(candidate) {
+            if let side = await openForSpace(candidate, now: now, cramped: cramped, blocked: &blocked) { sides.append(side) }
+        }
+        let plan = DiskSpace.plan(free: free, target: target, ladders: sides.map(\.ladder))
+        var reclaim = Reclaim(short: plan.short, blocked: blocked)
+        for side in sides {
+            if await makeRoom(side, drops: plan.drops[side.job.id] ?? 0, now: now) { reclaim.madeRoom = true }
+        }
+        // The reserve is back: so is the ballast (out of it — the ballast counts as free).
+        if let after = try? Syscalls.volumeInfo(at: job.destination.path),
+           DiskSpace.saturatingAdd(after.freeBytes, reaping()) >= target {
+            Self.placeBallast(for: job.destination, bytes: DiskSpace.ballastBytes(reserve: reserve))
+        }
+        let removed = plan.drops.values.reduce(0, +)
+        Self.spaceLog.notice("\(volume.freeBytes >> 20) MB free on the disk of \(job.name, privacy: .public), \(target >> 20) MB wanted: \(removed) restore points removed across \(plan.drops.count) jobs, \(plan.freeAfter >> 20) MB expected free\(plan.short ? " — still short" : "", privacy: .public)")
+        return reclaim
+    }
+
+    /// What a pass may still write to `job`'s disk: its free space — the share's, for a NAS image, whose own
+    /// free space means nothing — less a headroom as large as the ballast, so a catalog and the file system
+    /// always have room; space the reaper is freeing counts (not for an image: nothing is reaped in one).
+    private static func room(for job: BackupJob, jobRoot: URL, inImage: Bool) -> () -> Int64? {
+        let destination = job.destination
+        return {
+            guard let volume = try? Syscalls.volumeInfo(at: destination.path) else { return nil }
+            let headroom = DiskSpace.ballastBytes(reserve: DiskSpace.reserve(capacity: volume.totalBytes, jobs: [job]))
+            let reaping = inImage ? 0 : TreeReaper.shared.pendingBytes(under: jobRoot.path)
+            return volume.freeBytes + reaping - headroom
+        }
+    }
+
+    /// Room set aside on a destination to make room with once its disk is full (DiskSpace.ballastBytes).
+    static func ballastURL(for destination: URL) -> URL {
+        destination.appendingPathComponent("SpectaBackup/.space-reserve")
+    }
+
+    private static func size(of url: URL) -> Int64 {
+        var st = Darwin.stat()
+        return lstat(url.path, &st) == 0 ? Int64(st.st_size) : 0
+    }
+
+    /// Put the ballast on `destination` when it is missing: data that takes its full size whatever the file
+    /// system (a random pattern: a share that compresses cannot shrink it), written aside and renamed into
+    /// place, so a ballast is always whole.
+    private static func placeBallast(for destination: URL, bytes: Int64) {
+        let url = ballastURL(for: destination)
+        guard bytes > 0, (try? Syscalls.exists(url.path)) == false else { return }
+        let partial = url.deletingLastPathComponent().appendingPathComponent(".space-reserve.partial")
+        do {
+            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            FileManager.default.createFile(atPath: partial.path, contents: nil)
+            let handle = try FileHandle(forWritingTo: partial)
+            defer { try? handle.close() }
+            var chunk = Data(count: 1 << 20)
+            _ = chunk.withUnsafeMutableBytes { SecRandomCopyBytes(kSecRandomDefault, $0.count, $0.baseAddress!) }
+            var left = bytes
+            while left > 0 {
+                try handle.write(contentsOf: chunk.prefix(Int(min(left, Int64(chunk.count)))))
+                left -= Int64(chunk.count)
+            }
+            try handle.synchronize()
+            try Syscalls.atomicRename(partial.path, to: url.path)
+        } catch {
+            try? FileManager.default.removeItem(at: partial)
+        }
+    }
+
+    /// `job`'s backups opened to make room, with what each of its oldest restore points would free; nil when
+    /// they cannot be read (their repo locked without a password, the share unable to tell) or there are none.
+    /// `blocked`: set when they could not be opened for lack of room — the failure says so, or it came with
+    /// the disk `cramped` (less than a ballast's worth free).
+    private func openForSpace(_ job: BackupJob, now: Date, cramped: Bool, blocked: inout Bool) async -> SpaceSide? {
+        if job.encryptionEnabled {
+            guard let backend = try? existingRepo(of: job),
+                  let keys = try? await unlockRepo(backend, job: job).keys,
+                  let listing = try? await timeline.listing(jobID: job.id, backend: backend, keys: keys) else { return nil }
+            let maintenance = RepoMaintenance(backend: backend, keys: keys)
+            let protected = unfinishedPacks[job.id] ?? []
+            guard let survey = try? await maintenance.survey(needsGraph: true, needsIndex: true),
+                  let ladder = RepoMaintenance.ladder(policy: job.retention, snapshots: listing.snapshots,
+                                                      survey: survey, protecting: protected, now: now) else { return nil }
+            return SpaceSide(job: job, store: .encrypted(maintenance: maintenance, snapshots: listing.snapshots,
+                                                         survey: survey, protected: protected),
+                             ladder: DiskSpace.Ladder(jobID: job.id, garbage: ladder.garbage, steps: ladder.steps))
+        }
+        guard let inImage = try? Self.usesImage(job) else { return nil }
+        let lease = inImage ? ImageLease.shared(for: job.destination) : nil
+        let jobRoot: URL
+        if let lease {
+            guard let mount = try? lease.acquire(create: false) else { return nil }
+            jobRoot = Self.jobRoot(for: job, inImageAt: mount)
+        } else {
+            jobRoot = Self.jobRoot(for: job)
+        }
+        let layout = HistoryLayout(jobRoot: jobRoot)
+        let legacy = Self.legacyCatalog(at: jobRoot)
+        let snapshots = ((try? await legacy?.snapshots(jobID: job.id)) ?? []).filter(Self.isPlaintext)
+        let steps: [DiskSpace.Step]?
+        do {
+            // A pass that ran out of room left its last batch unsettled: settled now, so what it moved counts.
+            _ = try CaptureEngine(layout: layout).settleInterruptedPass()
+            steps = try HistoryMaintenance(layout: layout).ladder(policy: job.retention,
+                                                                  legacy: Self.legacyPoints(snapshots), now: now)
+        } catch {
+            if cramped || DiskSpace.isOutOfSpace(error) { blocked = true }
+            Self.spaceLog.error("the backups of \(job.name, privacy: .public) could not be opened to make room: \(String(describing: error), privacy: .public)")
+            steps = nil
+        }
+        guard let steps else {
+            lease?.release(flush: false)
+            return nil
+        }
+        return SpaceSide(job: job, store: .history(layout: layout, jobRoot: jobRoot, legacy: legacy, snapshots: snapshots,
+                                                   lease: lease),
+                         ladder: DiskSpace.Ladder(jobID: job.id, steps: steps))
+    }
+
+    /// Remove `drops` of the side's oldest restore points (an encrypted repo also collects its garbage), and
+    /// let go of what was opened. Returns whether anything went.
+    private func makeRoom(_ side: SpaceSide, drops: Int, now: Date) async -> Bool {
+        switch side.store {
+        case let .history(layout, jobRoot, legacy, _, lease):
+            // Deleted at once, not by the reaper: the room is wanted now.
+            let removed = drops > 0 ? await applyRetention(job: side.job, layout: layout, jobRoot: jobRoot, legacy: legacy,
+                                                           reapInBackground: false, pressureDrops: drops, now: now) : false
+            guard let lease else { return removed }
+            lease.release(flush: removed)
+            // Deleting inside an image frees nothing on the share until it is compacted.
+            if removed { lease.reclaimNow() }
+            return removed
+        case let .encrypted(maintenance, snapshots, survey, protected):
+            guard drops > 0 || side.ladder.garbage > 0 else { return false }
+            do {
+                let outcome = try await maintenance.run(policy: side.job.retention, snapshots: snapshots,
+                                                        pressure: .init(drops: drops), collect: true,
+                                                        protecting: protected, survey: survey, now: now)
+                if outcome.collected { timeline.recordCollection(side.job.id, at: now) }
+                await recordStoredBytes(of: side.job, in: maintenance.backend)
+                return !outcome.dropped.isEmpty || outcome.reclaimedBytes > 0
+            } catch {
+                Self.spaceLog.error("making room in the encrypted repo of \(side.job.name, privacy: .public) failed: \(String(describing: error), privacy: .public)")
+                return false
+            }
+        }
+    }
+
     // MARK: - Timeline
 
     /// The job's restore points (newest first), when it was last backed up, and what its backups occupy.
@@ -537,13 +802,16 @@ actor BackupRunner {
         // The job root on the destination: a direct job's plaintext backups.
         var history = await backups(at: Self.jobRoot(for: job), of: job)
         // Encrypted snapshots: the repo is their record. A pass that found nothing changed wrote none, but
-        // brought the backup up to date all the same.
-        for snapshot in (try? await encryptedSnapshots(of: job)) ?? [] {
+        // brought the backup up to date all the same. What the repo occupies was measured as its last pass
+        // ended (RepoTimeline).
+        let encrypted = (try? await encryptedSnapshots(of: job)) ?? []
+        for snapshot in encrypted {
             let time = Date(timeIntervalSince1970: snapshot.createdAt)
             history.points.append(RestorePoint(source: .encryptedSnapshot(id: snapshot.id), time: time,
                                                fileCount: Int64(snapshot.fileCount), bytes: Int64(snapshot.totalBytes)))
             history.lastBackup = max(history.lastBackup ?? time, time)
         }
+        if !encrypted.isEmpty { history.storageBytes += timeline.storedBytes(job.id) ?? 0 }
         if let end = timeline.captureState(job.id)?.lastPassEnd {
             let time = Date(timeIntervalSince1970: end)
             history.lastBackup = max(history.lastBackup ?? time, time)
@@ -871,6 +1139,7 @@ actor BackupRunner {
                 }
             }
             progress(pending.count, pending.count)
+            await recordStoredBytes(of: job, in: repo)
         }
 
         // 2) Everything is safely encrypted → now remove the plaintext — points an interrupted run encrypted

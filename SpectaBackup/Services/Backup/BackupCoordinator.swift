@@ -13,9 +13,10 @@
 //  - When a job runs is decided by its PassScheduler (pure, unit-tested): this class only feeds it
 //    events and performs the action it returns — start a pass now, or arm the job's single timer.
 //    Nothing that arrives while a job is busy is dropped; manual runs are never throttled.
-//  - A job never runs two passes at once (the scheduler's busy state). Each destination has its own
-//    runner actor: jobs on one destination (one disk, one NAS image) take turns, jobs on different
-//    destinations run side by side — a slow NAS never holds up the protection of local jobs.
+//  - A job never runs two passes at once (the scheduler's busy state). Each disk has its own runner actor
+//    (DiskSpace.diskKey — the volume a destination is on, from the mount table): jobs on one disk take turns,
+//    so the disk's reserve is kept across all of them (a pass is handed its neighbors there); jobs on
+//    different disks run side by side — a slow NAS never holds up the protection of local jobs.
 //  - Watchers only fire for changes the job's exclusions would not skip (ChangeFilter).
 //  - Realtime jobs get one catch-up pass at launch (changes made while SpectArk was not running), and
 //    one when they start running on changes (enabled, switched to realtime) or when what they back
@@ -49,7 +50,7 @@ final class BackupCoordinator {
     private let store = JobStore()
     /// False in a unit-test host: the saved job list is neither loaded nor overwritten (AppRuntime).
     private let usesSavedJobs: Bool
-    /// One runner per destination (standardized path), created on first use.
+    /// One runner per disk (DiskSpace.diskKey), created on first use.
     private var runners: [String: BackupRunner] = [:]
     private var watchers: [UUID: FolderWatcher] = [:]
     /// Per-job scheduling state; the source of truth for "busy" and for what runs next.
@@ -199,13 +200,21 @@ final class BackupCoordinator {
 
     // MARK: - Running
 
-    /// The runner that owns `job`'s destination.
+    /// The runner of the disk `job`'s destination is on: every job there takes turns on it, so the disk's
+    /// reserve can be kept across them all (BackupRunner.keepDiskReserve).
     private func runner(for job: BackupJob) -> BackupRunner {
-        let key = job.destination.standardizedFileURL.path
+        let key = DiskSpace.diskKey(for: job.destination)
         if let runner = runners[key] { return runner }
         let runner = BackupRunner()
         runners[key] = runner
         return runner
+    }
+
+    /// The other jobs whose destinations are on the same disk as `job`'s.
+    private func neighbors(of job: BackupJob) -> [BackupJob] {
+        let volumes = DestinationIdentity.mountedVolumes().map(\.url)
+        let disk = DiskSpace.diskKey(for: job.destination, volumes: volumes)
+        return jobs.filter { $0.id != job.id && DiskSpace.diskKey(for: $0.destination, volumes: volumes) == disk }
     }
 
     /// Back up now (the user, a new job, or a due schedule). Starts immediately, or right after the
@@ -243,8 +252,8 @@ final class BackupCoordinator {
         do {
             let job = try await locate(jobID)
             updateFreeSpace(jobID)
-            let result = try await runner(for: job).run(job: job, quietWindow: quietWindow, forceCheckpoint: requested,
-                                                        journalHints: hints, progress: progress)
+            let result = try await runner(for: job).run(job: job, neighbors: neighbors(of: job), quietWindow: quietWindow,
+                                                        forceCheckpoint: requested, journalHints: hints, progress: progress)
             let history = try? await runner(for: job).history(for: job)
             guard jobs.contains(where: { $0.id == jobID }) else { return forgetRemovedJob(jobID) }
             var st = state(for: jobID)

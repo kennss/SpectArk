@@ -8,8 +8,9 @@
 //               drops the oldest until the live data fits, never the newest; a snapshot that cannot be read
 //               stops the collection (reported) while the age and count rules go on; one the caller did not
 //               list keeps its data; what takes no writing is reclaimed before anything is rewritten; a folder
-//               the listing cannot read, or an object it cannot delete, stops it too; free space below the
-//               floor collects at once even when the garbage alone is enough.
+//               the listing cannot read, or an object it cannot delete, stops it too; under disk pressure
+//               the garbage counts first and is collected at once, the oldest snapshots asked for go (the
+//               ladder says what each frees), and packs a pass that ran out of room wrote are kept whole.
 //  @author      Kennt Kim
 //  @company     Calida Lab
 //  @created     2026-09-19
@@ -103,7 +104,7 @@ final class RepoMaintenanceTests: XCTestCase {
         let treesBefore = try await backend.list(prefix: "trees").count
 
         let outcome = try await maintenance().run(policy: keepOne, snapshots: summaries([first, second, third]),
-                                                  freeBytes: .max, collect: true, now: now)
+                                                  collect: true, now: now)
         XCTAssertEqual(outcome.dropped, [first.id, second.id])
         XCTAssertTrue(outcome.collected)
         XCTAssertGreaterThan(outcome.reclaimedBytes, 100_000)
@@ -124,14 +125,14 @@ final class RepoMaintenanceTests: XCTestCase {
         let packsBefore = try await backend.list(prefix: "data").count
 
         let dropped = try await maintenance().run(policy: keepOne, snapshots: summaries([first, second]),
-                                                  freeBytes: .max, collect: false, now: now)
+                                                  collect: false, now: now)
         XCTAssertEqual(dropped.dropped, [first.id])
         XCTAssertFalse(dropped.collected)
         let packsWaiting = try await backend.list(prefix: "data").count
         XCTAssertEqual(packsWaiting, packsBefore, "unreachable, not yet reclaimed")
 
         let collected = try await maintenance().run(policy: keepOne, snapshots: summaries([second]),
-                                                    freeBytes: .max, collect: true, now: now)
+                                                    collect: true, now: now)
         XCTAssertTrue(collected.collected)
         let packsAfter = try await backend.list(prefix: "data").count
         XCTAssertLessThan(packsAfter, packsBefore)
@@ -150,15 +151,13 @@ final class RepoMaintenanceTests: XCTestCase {
 
         let crashing = maintenance { if $0 == step { throw Interrupted() } }
         do {
-            _ = try await crashing.run(policy: keepOne, snapshots: summaries([first, second]), freeBytes: .max,
-                                       collect: true, now: now)
+            _ = try await crashing.run(policy: keepOne, snapshots: summaries([first, second]), collect: true, now: now)
             XCTFail("interrupted")
         } catch is Interrupted {}
         let meanwhile = try await restore(second.id)
         XCTAssertEqual(meanwhile["shared"], shared, "restorable while interrupted")
 
-        _ = try await maintenance().run(policy: keepOne, snapshots: summaries([second]), freeBytes: .max,
-                                        collect: true, now: now)
+        _ = try await maintenance().run(policy: keepOne, snapshots: summaries([second]), collect: true, now: now)
         let restored = try await restore(second.id)
         XCTAssertEqual(restored["shared"], shared)
         let blobs = try await blobCount()
@@ -187,13 +186,12 @@ final class RepoMaintenanceTests: XCTestCase {
         let all = summaries([first, second, third])
 
         let quota = RetentionPolicy(mode: .keepAll, maxTotalBytes: 250_000)
-        let outcome = try await maintenance().run(policy: quota, snapshots: all, freeBytes: .max, collect: false, now: now)
+        let outcome = try await maintenance().run(policy: quota, snapshots: all, collect: false, now: now)
         XCTAssertEqual(outcome.dropped, [first.id], "two newest fit")
         XCTAssertTrue(outcome.collected, "space pressure collects right away")
 
         let tiny = RetentionPolicy(mode: .keepAll, maxTotalBytes: 1)
-        let squeezed = try await maintenance().run(policy: tiny, snapshots: summaries([second, third]), freeBytes: .max,
-                                                   collect: false, now: now)
+        let squeezed = try await maintenance().run(policy: tiny, snapshots: summaries([second, third]), collect: false, now: now)
         XCTAssertEqual(squeezed.dropped, [second.id], "the newest stays, over quota or not")
         let restored = try await restore(third.id)
         XCTAssertEqual(restored["shared"], shared)
@@ -207,8 +205,7 @@ final class RepoMaintenanceTests: XCTestCase {
         let treesBefore = try await backend.list(prefix: "trees").count
 
         let outcome = try await maintenance().run(policy: RetentionPolicy(mode: .keepAll),
-                                                  snapshots: summaries([first, second]), freeBytes: .max,
-                                                  collect: true, now: now)
+                                                  snapshots: summaries([first, second]), collect: true, now: now)
         XCTAssertEqual(outcome.unreadable, [second.id], "its references are unknown: reported")
         XCTAssertFalse(outcome.collected)
         let packsAfter = try await backend.list(prefix: "data").count
@@ -224,7 +221,7 @@ final class RepoMaintenanceTests: XCTestCase {
         try await backend.put(key: "snapshots/\(second.id)", data: Data("damaged".utf8))
         let quota = RetentionPolicy(mode: .keepCount(2), maxTotalBytes: 10)   // space rules wait while it is there
         let outcome = try await maintenance().run(policy: quota, snapshots: summaries([first, second, third]),
-                                                  freeBytes: .max, collect: true, now: now)
+                                                  collect: true, now: now)
         XCTAssertEqual(outcome.dropped, [first.id], "keep 2 still applies")
         XCTAssertEqual(outcome.unreadable, [second.id])
         XCTAssertFalse(outcome.collected)
@@ -239,8 +236,7 @@ final class RepoMaintenanceTests: XCTestCase {
 
         let stopped = maintenance { if $0 == .garbageRemoved { throw Interrupted() } }   // a full disk would stop here
         do {
-            _ = try await stopped.run(policy: keepOne, snapshots: summaries([first, second, third]), freeBytes: .max,
-                                      collect: true, now: now)
+            _ = try await stopped.run(policy: keepOne, snapshots: summaries([first, second, third]), collect: true, now: now)
             XCTFail("stopped before writing")
         } catch is Interrupted {}
         let packsAfter = try await backend.list(prefix: "data").count
@@ -256,7 +252,7 @@ final class RepoMaintenanceTests: XCTestCase {
         let second = try await backUp(["b": bytes(30_000)], at: 2_000)
         // The timeline could not read the first (not cached, no keys at hand): the collection must see it anyway.
         _ = try await maintenance().run(policy: RetentionPolicy(mode: .keepAll), snapshots: summaries([second]),
-                                        freeBytes: .max, collect: true, now: now)
+                                        collect: true, now: now)
         let restored = try await restore(first.id)
         XCTAssertEqual(restored.keys.sorted(), ["a"])
     }
@@ -272,8 +268,7 @@ final class RepoMaintenanceTests: XCTestCase {
         let packsBefore = try FileWalkerCount.files(under: backend.root.appendingPathComponent("data"))
 
         do {
-            _ = try await maintenance().run(policy: keepOne, snapshots: summaries([first, second]), freeBytes: .max,
-                                            collect: true, now: now)
+            _ = try await maintenance().run(policy: keepOne, snapshots: summaries([first, second]), collect: true, now: now)
             XCTFail("an index that cannot be listed is no empty index")
         } catch {}
         chmod(unreadable, 0o755)
@@ -294,17 +289,73 @@ final class RepoMaintenanceTests: XCTestCase {
         try await backend.delete(key: "snapshots/none")   // already gone: fine
     }
 
-    func testFreeSpaceBelowTheFloorCollectsAtOnceEvenWhenGarbageAloneIsEnough() async throws {
+    func testUnderPressureTheGarbageCountsFirstAndIsCollectedAtOnce() async throws {
         let first = try await backUp(["a": bytes(100_000)], at: 1_000)
         let second = try await backUp(["b": bytes(1_000)], at: 2_000)
-        _ = try await maintenance().run(policy: keepOne, snapshots: summaries([first, second]), freeBytes: .max,
-                                        collect: false, now: now)   // dropped; its data waits for the collection
-        let floor = RetentionPolicy(mode: .keepAll, minimumFreeBytes: 50_000)
-        let outcome = try await maintenance().run(policy: floor, snapshots: summaries([second]), freeBytes: 10_000,
-                                                  collect: false, now: now)
+        _ = try await maintenance().run(policy: keepOne, snapshots: summaries([first, second]), collect: false, now: now)   // dropped; its data waits for the collection
+        let survey = try await maintenance().survey(needsGraph: true, needsIndex: true)
+        let ladder = try XCTUnwrap(RepoMaintenance.ladder(policy: .automatic, snapshots: summaries([second]),
+                                                          survey: survey, now: now))
+        XCTAssertGreaterThan(ladder.garbage, 90_000, "freed with no restore point lost")
+        XCTAssertTrue(ladder.steps.isEmpty, "the newest never goes")
+
+        let outcome = try await maintenance().run(policy: .automatic, snapshots: summaries([second]),
+                                                  pressure: .init(drops: 0), collect: false, survey: survey, now: now)
         XCTAssertTrue(outcome.collected, "short of space now: the garbage is collected now")
         XCTAssertTrue(outcome.dropped.isEmpty, "collecting it is enough")
         XCTAssertGreaterThan(outcome.reclaimedBytes, 90_000)
+    }
+
+    func testPressureDropsTheOldestItIsAskedForAndTheLadderSaysWhatEachFrees() async throws {
+        let first = try await backUp(["a": bytes(60_000)], at: 1_000)
+        let second = try await backUp(["b": bytes(30_000)], at: 2_000)
+        let third = try await backUp(["c": bytes(1_000)], at: 3_000)
+        let all = summaries([first, second, third])
+        let survey = try await maintenance().survey(needsGraph: true, needsIndex: true)
+        let ladder = try XCTUnwrap(RepoMaintenance.ladder(policy: .automatic, snapshots: all, survey: survey, now: now))
+        XCTAssertEqual(ladder.steps.map(\.time), [Date(timeIntervalSince1970: 1_000), Date(timeIntervalSince1970: 2_000)])
+        XCTAssertGreaterThan(ladder.steps[0].freed, 60_000)
+        XCTAssertGreaterThan(ladder.steps[1].freed, 30_000)
+        XCTAssertLessThan(ladder.steps[1].freed, 40_000)
+
+        let outcome = try await maintenance().run(policy: .automatic, snapshots: all, pressure: .init(drops: 1),
+                                                  collect: false, survey: survey, now: now)
+        XCTAssertEqual(outcome.dropped, [first.id])
+        XCTAssertTrue(outcome.collected)
+        let kept = try await restore(second.id)
+        XCTAssertEqual(kept["b"]?.count, 30_000)
+    }
+
+    func testProtectedPacksAreKeptWholeAndNotCountedAsGarbage() async throws {
+        // A pass that ran out of room stored its blobs, and wrote no snapshot.
+        let source = root.appendingPathComponent("unfinished", isDirectory: true)
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+        let pending = bytes(80_000)
+        try pending.write(to: source.appendingPathComponent("big"))
+        let engine = DedupEngine(backend: backend, keys: keys, chunker: config.chunker)
+        try await engine.open()
+        _ = try await engine.backUp(sources: [source], snapshotID: "t1000", now: 1_000,
+                                    exclusions: .includeEverything, toleratingVanishedEntries: false)
+        try await backend.delete(key: "snapshots/t1000")   // as if the pass failed before its snapshot
+        let protected = await engine.packsWritten()
+        XCTAssertFalse(protected.isEmpty)
+        let kept = try await backUp(["k": bytes(1_000)], at: 2_000)
+
+        let survey = try await maintenance().survey(needsGraph: true, needsIndex: true)
+        let ladder = try XCTUnwrap(RepoMaintenance.ladder(policy: .automatic, snapshots: summaries([kept]), survey: survey,
+                                                          protecting: protected, now: now))
+        XCTAssertLessThan(ladder.garbage, 10_000, "what the unfinished pass stored is no garbage to count on")
+        _ = try await maintenance().run(policy: .automatic, snapshots: summaries([kept]), pressure: .init(drops: 0),
+                                        collect: true, protecting: protected, survey: survey, now: now)
+        let stored = try await blobCount().count
+        XCTAssertGreaterThan(stored, 1, "the unfinished pass's blobs stay for the next try")
+
+        _ = try await maintenance().run(policy: .automatic, snapshots: summaries([kept]), pressure: .init(drops: 0),
+                                        collect: true, now: now)
+        let after = try await blobCount().count
+        XCTAssertLessThan(after, stored, "unprotected, they are garbage like any other")
+        let left = try await restore(kept.id)
+        XCTAssertEqual(left["k"]?.count, 1_000)
     }
 }
 

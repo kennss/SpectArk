@@ -83,9 +83,18 @@ struct LocalBackend: Backend {
     /// listing that silently left something out would have garbage collection delete what it did not see.
     /// A prefix with no folder lists nothing. Dot-names (a put in progress, Finder's files) are skipped.
     func list(prefix: String) async throws -> [String] {
+        try walk(prefix).map(\.key)
+    }
+
+    func bytes(prefix: String) async throws -> Int64 {
+        try walk(prefix).reduce(Int64(0)) { $0 + $1.size }
+    }
+
+    /// Every object under `prefix`, with its size.
+    private func walk(_ prefix: String) throws -> [(key: String, size: Int64)] {
         let base = (prefix.isEmpty ? root : url(prefix)).path
         guard try Syscalls.exists(base) else { return [] }
-        var keys: [String] = []
+        var objects: [(key: String, size: Int64)] = []
         var folders = [""]
         while let rel = folders.popLast() {
             let folder = rel.isEmpty ? base : base + "/" + rel
@@ -99,11 +108,11 @@ struct LocalBackend: Backend {
                 if st.st_mode & S_IFMT == S_IFDIR {
                     folders.append(childRel)
                 } else {
-                    keys.append(prefix.isEmpty ? childRel : prefix + "/" + childRel)
+                    objects.append((prefix.isEmpty ? childRel : prefix + "/" + childRel, Int64(st.st_size)))
                 }
             }
         }
-        return keys
+        return objects
     }
 
     /// Remove an object; one already gone is fine. Any other failure throws — garbage collection relies on

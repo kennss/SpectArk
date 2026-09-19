@@ -46,6 +46,11 @@
 //    parent's realpath must be the parent itself (MirrorGuard). The plan never produces such a path;
 //    the guard covers the source changing between planning and applying, and recovery rolls back an
 //    intent whose parent does not resolve inside current/.
+//  - Each batch is begun only if its writes fit in the `room` the caller reports (free space less a
+//    headroom); a batch that does not fit, or that fails for lack of room, throws `CaptureError.outOfSpace`
+//    with what the rest of the plan writes. The check comes first because a full share never fails a
+//    write into a NAS image: the writes are lost silently (measured). The batches before it stay done, so a pass tried again once the disk has made room
+//    (BackupRunner, DiskSpace) goes on from there; `settleInterruptedPass` settles the failed batch first.
 //  - `faultHook` exists for the crash-recovery tests: throwing from it simulates a crash at that step.
 //
 
@@ -77,11 +82,15 @@ struct CaptureOutcome: Sendable {
 enum CaptureError: Error, CustomStringConvertible {
     /// A path's parent in current/ resolves elsewhere (a symlink or a letter-case variant on the way).
     case pathEscapesMirror(String)
+    /// The backup disk ran out of room; what was left of the pass would still write `needed` bytes.
+    case outOfSpace(needed: Int64)
 
     var description: String {
         switch self {
         case let .pathEscapesMirror(path):
             return "cannot place \(path) in the backup: a folder on its way is a link or differs only in letter case"
+        case let .outOfSpace(needed):
+            return "the backup disk is full (\(needed) bytes still to write)"
         }
     }
 }
@@ -114,10 +123,13 @@ struct CaptureEngine: Sendable {
 
     /// Run one capture pass. `forceCheckpoint` (Back Up Now) seals regardless of spacing. `journalHints`:
     /// per source name, a later cursor a replay may start from (JournalCursor.advanced).
+    /// `room`: bytes the backup disk may still take (nil: unknown) — asked before each batch, which is not
+    /// written unless it fits (BackupRunner: free space less a headroom).
     func runPass(job: BackupJob,
                  quietWindow: TimeInterval,
                  forceCheckpoint: Bool,
                  journalHints: [String: JournalHint] = [:],
+                 room: (() -> Int64?)? = nil,
                  now: () -> Date = { Date() },
                  progress: (BackupProgress) -> Void = { _ in }) throws -> CaptureOutcome {
         let fm = FileManager.default
@@ -133,9 +145,10 @@ struct CaptureEngine: Sendable {
         var sealed: [HistoryCheckpoint] = []
 
         // A state the previous pass left unsealed becomes a checkpoint once spacing allows (docs §3.3.2).
-        // Not after recovery: the recovered changes belong to an interrupted pass, so current/ never
-        // matched the source in that state — the end of this pass seals instead.
-        if recovered == 0, try store.hasUnsealedChanges(), try spacingElapsed(store, at: now()) {
+        // Not when that pass never finished — interrupted, or failed for a full disk, whether its intents
+        // were settled here or before (BackupRunner settles them to make room): current/ never matched the
+        // source in that state — the end of this pass seals instead.
+        if try !store.passLeftOpen(), try store.hasUnsealedChanges(), try spacingElapsed(store, at: now()) {
             sealed.append(try store.seal(at: try store.lastPassEnd() ?? now()))
         }
 
@@ -143,10 +156,25 @@ struct CaptureEngine: Sendable {
         let scope = try discover(job: job, store: store, hints: journalHints, now: start)
         let plan = try makePlan(job: job, scope: scope, store: store, quietWindow: quietWindow)
         var stats = ApplyStats()
-        for batch in stride(from: 0, to: plan.operations.count, by: Self.batchSize).map({
+        if !plan.operations.isEmpty { try store.beginPass() }
+        let batches = stride(from: 0, to: plan.operations.count, by: Self.batchSize).map {
             Array(plan.operations[$0..<min($0 + Self.batchSize, plan.operations.count)])
-        }) {
-            try apply(batch, store: store, settling: quietWindow == 0, stats: &stats, progress: progress)
+        }
+        for (number, batch) in batches.enumerated() {
+            // What the rest of the plan writes, this batch included: the room the disk must make before the
+            // pass is tried again (BackupRunner). The batches before stay done.
+            func stillToWrite() -> Int64 { batches[number...].joined().reduce(Int64(0)) { $0 + $1.bytesWritten } }
+            // A batch that would not fit is not begun: a full disk is not waited for — inside a NAS image it
+            // never says so (measured: writes into an image whose share is full all succeed, and are gone
+            // once it is attached again).
+            if let left = room?(), batch.reduce(Int64(0), { $0 + $1.bytesWritten }) > left {
+                throw CaptureError.outOfSpace(needed: stillToWrite())
+            }
+            do {
+                try apply(batch, store: store, settling: quietWindow == 0, stats: &stats, progress: progress)
+            } catch where DiskSpace.isOutOfSpace(error) {
+                throw CaptureError.outOfSpace(needed: stillToWrite())
+            }
         }
 
         let end = now()
@@ -269,6 +297,12 @@ struct CaptureEngine: Sendable {
         case put(path: String, source: String, kind: HistoryItemKind, size: Int64, mtimeNs: Int64,
                  lockFlags: UInt32, old: HistoryEntry?)
         case remove(entry: HistoryEntry)
+
+        /// Bytes the operation writes to the backup disk.
+        var bytesWritten: Int64 {
+            if case let .put(_, _, _, size, _, _, _) = self { return size }
+            return 0
+        }
     }
 
     private struct Plan {
@@ -685,6 +719,13 @@ struct CaptureEngine: Sendable {
     }
 
     // MARK: - Recovery
+
+    /// Settle what an interrupted pass left (its intents), without running one — so retention can run on a
+    /// history a failed pass left (a full disk). Returns how many intents there were; none without a catalog.
+    func settleInterruptedPass() throws -> Int {
+        guard try Syscalls.exists(layout.catalogPath) else { return 0 }
+        return try recover(try HistoryStore(path: layout.catalogPath))
+    }
 
     /// Settle intents left by an interrupted pass. Returns how many there were.
     private func recover(_ store: HistoryStore) throws -> Int {

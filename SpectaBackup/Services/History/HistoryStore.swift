@@ -150,12 +150,15 @@ final class HistoryStore {
 
     enum StoreError: Error, CustomStringConvertible {
         case open(path: String, code: Int32)
-        case sql(message: String, code: Int32)
+        /// `systemErrno`: the OS error beneath it (sqlite3_system_errno) — a full disk can surface as a disk
+        /// I/O error (measured: SQLITE_IOERR opening a catalog on a full APFS volume), told apart by ENOSPC here.
+        case sql(message: String, code: Int32, systemErrno: Int32 = 0)
 
         var description: String {
             switch self {
             case let .open(path, code): return "history catalog open failed for \(path) (code \(code))"
-            case let .sql(message, code): return "history catalog error: \(message) (code \(code))"
+            case let .sql(message, code, systemErrno):
+                return "history catalog error: \(message) (code \(code)\(systemErrno != 0 ? ", errno \(systemErrno)" : ""))"
             }
         }
     }
@@ -689,7 +692,19 @@ final class HistoryStore {
             try setMeta("settings_fingerprint", fingerprint)
             try setMeta("last_pass_end", String(end.timeIntervalSince1970))
             if let fullScanAt { try setMeta("last_full_scan", String(fullScanAt.timeIntervalSince1970)) }
+            try setMeta("pass_open", "0")
         }
+    }
+
+    /// A pass is about to change current/: until `finishPass`, current/ matches no moment of the source.
+    func beginPass() throws {
+        try setMeta("pass_open", "1")
+    }
+
+    /// A pass began changing current/ and never finished (interrupted, or failed — a full disk): what it left
+    /// is no state the source was ever in, so it is sealed only by a pass that finishes.
+    func passLeftOpen() throws -> Bool {
+        try (metaInt("pass_open") ?? 0) != 0
     }
 
     // MARK: - Browsing
@@ -938,7 +953,7 @@ final class HistoryStore {
         if sqlite3_exec(db, sql, nil, nil, &err) != SQLITE_OK {
             let message = err.map { String(cString: $0) } ?? "unknown"
             sqlite3_free(err)
-            throw StoreError.sql(message: message, code: sqlite3_errcode(db))
+            throw StoreError.sql(message: message, code: sqlite3_extended_errcode(db), systemErrno: sqlite3_system_errno(db))
         }
     }
 
@@ -953,7 +968,8 @@ final class HistoryStore {
     }
 
     private func sqlError() -> StoreError {
-        .sql(message: String(cString: sqlite3_errmsg(db)), code: sqlite3_errcode(db))
+        .sql(message: String(cString: sqlite3_errmsg(db)), code: sqlite3_extended_errcode(db),
+             systemErrno: sqlite3_system_errno(db))
     }
 
     private func bindText(_ stmt: OpaquePointer?, _ index: Int32, _ value: String) {

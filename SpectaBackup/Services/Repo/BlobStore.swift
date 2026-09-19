@@ -77,6 +77,8 @@ actor BlobStore {
     struct Location: Sendable { let packID: String; let offset: Int; let length: Int }
 
     private var index: [Data: Location] = [:]
+    /// Packs this store wrote: a pass that failed leaves its work in them, for the next try to reuse.
+    private(set) var packsWritten: Set<String> = []
     private var pending: [(blobID: Data, ciphertext: Data)] = []
     private var pendingIDs: Set<Data> = []
     private var pendingSize = 0
@@ -143,6 +145,7 @@ actor BlobStore {
     func flush() async throws {
         guard !pending.isEmpty else { return }
         let pack = try await PackFormat.write(pending, backend: backend, cipher: cipher)
+        packsWritten.insert(pack.packID)
         for entry in pack.entries {
             index[entry.blobID] = Location(packID: pack.packID, offset: entry.offset, length: entry.length)
         }

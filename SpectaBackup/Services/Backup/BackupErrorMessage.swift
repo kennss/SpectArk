@@ -18,6 +18,8 @@ enum BackupErrorMessage {
     static func describe(_ error: Error) -> String {
         // Our own typed errors already carry friendly descriptions.
         if let e = error as? EncryptedBackupError { return e.description }
+        if let e = error as? DiskFullError { return e.description }
+        if DiskSpace.isOutOfSpace(error) { return "The backup disk is full." }
         if let e = error as? RepoCryptoError { return e.description }
         if let e = error as? RepoManagerError { return e.description }
         if let e = error as? BlobStoreError { return e.description }

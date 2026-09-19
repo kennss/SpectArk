@@ -7,6 +7,12 @@ All notable changes to SpectArk are documented here. The format follows
 ## [Unreleased]
 
 ### Changed
+- **A full backup disk makes room by deleting its oldest backups, as Time Machine does.** Every backup disk
+  now keeps 5% of itself free (or what you set in "Keep free space"); when less is free, the oldest restore
+  points on that disk go first — across all the backups on it, whichever they belong to — until there is
+  room again. Each backup's newest restore point always stays, and backups set to Keep all give up nothing
+  unless you set a free-space value for them. Before, free space was only watched when you set a value, and
+  only within one backup.
 - **Encrypted backups work like the others now.** A pass reads only what changed — unchanged files are not
   read again, and folders nothing changed in are not even listed (the same macOS file-system journal the
   plain backups use) — so a realtime encrypted backup no longer re-reads the whole folder on every save.
@@ -14,7 +20,7 @@ All notable changes to SpectArk are documented here. The format follows
   nothing changed adds no restore point; and a restore point is kept at most every 15 minutes, plus every
   state you left alone and every Back Up Now.
 - **Encrypted backups are thinned like the others.** The backup's retention policy (Automatic, keep N,
-  keep N days, a quota, a free-space floor) now applies to encrypted snapshots too, and the space only
+  keep N days, a quota) and the disk's free space now apply to encrypted snapshots too, and the space only
   the dropped ones used is given back — once a day, or right away when space is short. Before, an
   encrypted backup kept every snapshot and only ever grew.
 - **A new backup engine: every change protected within seconds, a restore point at most every
@@ -49,6 +55,19 @@ All notable changes to SpectArk are documented here. The format follows
   day's restore point rather than two; it used to split days at midnight UTC.
 
 ### Fixed
+- **A NAS backup never writes more than the share can hold.** When a NAS share fills up, writes into the
+  backup image on it fail silently — they seem to succeed, and are gone the next time the image is opened.
+  A backup now checks the share's free space before each batch of files and stops before it would not fit;
+  room is made (the oldest restore points go) and it carries on.
+- **Encrypted backups show how much space they take** in the backup quota gauge (it read 0).
+- **Quitting SpectArk while it was compacting a NAS backup image** left the compaction running on its own,
+  holding the image with nothing holding its lock; the next launch could open the image in the middle of
+  it. Quitting (and sleep) now stops the compaction cleanly first.
+- **A backup that runs out of disk space no longer stays stuck.** It used to fail the same way on every
+  try, because the cleanup that would have made room waited for it to finish first. Now it makes room
+  — the oldest restore points go — and carries on from where it stopped; it stops with "The backup disk is
+  full" only when nothing more may be removed. SpectArk also keeps a little room set aside on each backup
+  disk (a hidden `.space-reserve` file), because on a completely full disk even the cleanup cannot start.
 - **NAS backups give space back as old versions are thinned.** Deleting inside the backup image on the NAS
   did not shrink it; now, once 1 GB or more has been freed in the image, it is compacted as it is put away
   after a backup. What a compaction could not give back (free space scattered through the image) is

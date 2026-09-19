@@ -8,7 +8,7 @@
 //  @author      Kennt Kim
 //  @company     Calida Lab
 //  @created     2026-06-29
-//  @lastUpdated 2026-09-18
+//  @lastUpdated 2026-09-19
 //
 
 import XCTest
@@ -23,29 +23,30 @@ final class RetentionSchedulerTests: XCTestCase {
         .init(id: seq, time: now.addingTimeInterval(-ageSec), bytes: blocks * 512)
     }
 
-    private func plan(_ policy: RetentionPolicy, _ snaps: [HistoryRetention.LegacySnapshot], free: Int64) -> Set<Int64> {
+    private func plan(_ policy: RetentionPolicy, _ snaps: [HistoryRetention.LegacySnapshot],
+                      pressureDrops: Int = 0) -> Set<Int64> {
         HistoryRetention.plan(policy: policy, checkpoints: [], versions: [], currentBytes: 0, legacy: snaps,
-                              freeBytes: free, now: now).legacySnapshots
+                              pressureDrops: pressureDrops, now: now).legacySnapshots
     }
 
     // MARK: - Policy
 
     func testKeepCountDropsOldest() {
         let snaps = (1...5).map { snap(Int64($0), ageSec: Double(6 - $0) * 3600) }
-        let deleted = plan(RetentionPolicy(mode: .keepCount(2)), snaps, free: .max)
+        let deleted = plan(RetentionPolicy(mode: .keepCount(2)), snaps)
         XCTAssertEqual(deleted, [1, 2, 3])   // keep newest 2 (seq 4,5)
     }
 
     func testKeepDaysDropsOld() {
         let snaps = [snap(1, ageSec: 10 * 86_400), snap(2, ageSec: 8 * 86_400),
                      snap(3, ageSec: 3 * 86_400), snap(4, ageSec: 1 * 86_400)]
-        let deleted = plan(RetentionPolicy(mode: .keepDays(7)), snaps, free: .max)
+        let deleted = plan(RetentionPolicy(mode: .keepDays(7)), snaps)
         XCTAssertEqual(deleted, [1, 2])      // older than 7 days
     }
 
     func testAutomaticKeepsRecent() {
         let snaps = [snap(1, ageSec: 3 * 3600), snap(2, ageSec: 2 * 3600), snap(3, ageSec: 1 * 3600)]
-        let deleted = plan(RetentionPolicy(mode: .automatic), snaps, free: .max)
+        let deleted = plan(RetentionPolicy(mode: .automatic), snaps)
         XCTAssertTrue(deleted.isEmpty)       // all within 24h → all kept
     }
 
@@ -54,26 +55,32 @@ final class RetentionSchedulerTests: XCTestCase {
     func testQuotaDropsOldestUntilUnderLimit() {
         // 5 snapshots, ~512 KB each; quota 1.1 MB → keep newest 2.
         let snaps = (1...5).map { snap(Int64($0), ageSec: Double(6 - $0) * 3600, blocks: 1000) }
-        let deleted = plan(RetentionPolicy(mode: .keepAll, maxTotalBytes: 1_100_000), snaps, free: .max)
+        let deleted = plan(RetentionPolicy(mode: .keepAll, maxTotalBytes: 1_100_000), snaps)
         XCTAssertEqual(deleted, [1, 2, 3])
     }
 
     func testMinimumFreeSpaceDropsOldest() {
-        // 5 snapshots ~5 MB each; free 1 MB, want >= 11 MB free → drop 2 oldest.
+        // 5 snapshots ~5 MB each; free 1 MB, want >= 11 MB free → the disk asks for the 2 oldest.
         let snaps = (1...5).map { snap(Int64($0), ageSec: Double(6 - $0) * 3600, blocks: 10_000) }
-        let deleted = plan(RetentionPolicy(mode: .keepAll, minimumFreeBytes: 11_000_000), snaps, free: 1_000_000)
-        XCTAssertEqual(deleted, [1, 2])
+        let policy = RetentionPolicy(mode: .keepAll, minimumFreeBytes: 11_000_000)
+        let ladder = HistoryRetention.ladder(policy: policy, checkpoints: [], versions: [], currentBytes: 0,
+                                             legacy: snaps, now: now)
+        let disk = DiskSpace.plan(free: 1_000_000, target: 11_000_000,
+                                  ladders: [DiskSpace.Ladder(jobID: UUID(), steps: ladder)])
+        let drops = disk.drops.values.first ?? 0
+        XCTAssertEqual(drops, 2)
+        XCTAssertEqual(plan(policy, snaps, pressureDrops: drops), [1, 2])
     }
 
     func testNewestNeverDropped() {
         let snaps = (1...4).map { snap(Int64($0), ageSec: Double(5 - $0) * 3600, blocks: 10) }
-        let deleted = plan(RetentionPolicy(mode: .keepAll, maxTotalBytes: 1), snaps, free: .max)
+        let deleted = plan(RetentionPolicy(mode: .keepAll, maxTotalBytes: 1), snaps)
         XCTAssertEqual(deleted.count, 3)
         XCTAssertFalse(deleted.contains(4))  // newest survives even under an impossible quota
     }
 
     func testSingleSnapshotNeverDeleted() {
-        let deleted = plan(RetentionPolicy(mode: .keepAll, maxTotalBytes: 1), [snap(1, ageSec: 0, blocks: 999)], free: 1)
+        let deleted = plan(RetentionPolicy(mode: .keepAll, maxTotalBytes: 1), [snap(1, ageSec: 0, blocks: 999)])
         XCTAssertTrue(deleted.isEmpty)
     }
 

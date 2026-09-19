@@ -46,11 +46,6 @@ The repo is the encrypted job's only record (RepoTimeline; no catalog at the des
 
 ## P4 — Robustness / nice-to-have
 
-- **Plaintext retention when the disk is full.** A capture pass that fails for lack of space (ENOSPC) leaves
-  intents behind, and maintenance waits while intents are pending; recovery runs only at the start of the
-  next pass, which fails the same way. Free space before capturing when the destination is short (seal and
-  thin first, or recover then run retention), as encrypted jobs now do after a failed pass.
-
 - **Bit-rot scrub** — periodically re-hash stored backups (current/ and versions/) to detect silent
   corruption.
 - **Battery / sleep gating** — option to skip or defer passes on battery; resume on wake.

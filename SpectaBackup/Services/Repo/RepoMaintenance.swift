@@ -3,7 +3,8 @@
 //  @description Retention and garbage collection for an encrypted repo. The job's retention policy thins
 //               its snapshots — the restore points (RepoTimeline) — as it thins plaintext history:
 //               Automatic (Time Machine), keep N, keep N days, keep all, then the oldest dropped while the
-//               quota is exceeded or free space is short. Dropping a snapshot deletes its object; the data
+//               quota is exceeded — and as many more as a disk short of space asks for (DiskSpace; `ladder`
+//               tells it what each would free). Dropping a snapshot deletes its object; the data
 //               only it referenced is reclaimed by collecting garbage: packs nothing references go, packs
 //               partly dead are rewritten with their live blobs only, and trees nothing references go.
 //  @author      Kennt Kim
@@ -34,6 +35,9 @@
 //    it is. Live ciphertexts are copied as they are: a blob's ciphertext does not depend on its pack.
 //  - Collecting reads every live tree, so the caller runs it at most once a day unless space is short;
 //    until then a dropped snapshot's data stays on disk, unreachable.
+//  - Free space is not a per-job rule: the disk keeps its reserve across all its jobs (DiskSpace). Under
+//    pressure a run collects at once, its garbage counted first (it costs no restore point), then drops the
+//    oldest snapshots it is asked for. The ladder and the run share one survey: the graph is read once.
 //  - Runs with nothing else writing the repo (BackupRunner's turn).
 //
 
@@ -71,23 +75,46 @@ struct RepoMaintenance: Sendable {
         var unreadable: [String] = []
     }
 
-    /// Apply `policy` to the repo's `snapshots` (those the timeline could read). Garbage is collected when
-    /// `collect` (the caller's schedule) — and always under space pressure. What is kept is every snapshot
-    /// object in the repo the plan did not drop, whether or not the caller listed it: one it could not read
-    /// makes the collection stop, never lose its data.
-    func run(policy: RetentionPolicy, snapshots: [RepoSnapshotSummary], freeBytes: Int64, collect: Bool,
-             now: Date, calendar: Calendar = .autoupdatingCurrent) async throws -> Outcome {
+    /// The disk is short of space (DiskSpace): collect now, rewriting every pack any part of which is dead,
+    /// and drop `drops` more of the oldest snapshots the policy and the quota leave.
+    struct Pressure: Equatable, Sendable {
+        var drops = 0
+    }
+
+    /// What a run reads before deciding: the snapshot objects present, the index, and — when the space rules
+    /// need it — every snapshot's references. Taken once for a ladder and the run that follows it.
+    struct Survey: Sendable {
+        let present: [String]
+        let index: [PackFormat.IndexedPack]
+        let graph: Graph?
+    }
+
+    func survey(needsGraph: Bool, needsIndex: Bool) async throws -> Survey {
         let prefix = "snapshots/"
         let present = try await backend.list(prefix: "snapshots").map { String($0.dropFirst(prefix.count)) }
+        let index = needsGraph || needsIndex ? try await PackFormat.readIndex(backend: backend, cipher: cipher) : []
+        return Survey(present: present, index: index, graph: needsGraph ? try await loadGraph(present, index: index) : nil)
+    }
+
+    /// Apply `policy` to the repo's `snapshots` (those the timeline could read). Garbage is collected when
+    /// `collect` (the caller's schedule) — and always under `pressure`. What is kept is every snapshot object
+    /// in the repo the plan did not drop, whether or not the caller listed it: one it could not read makes the
+    /// collection stop, never lose its data. `protecting`: packs a failed pass wrote — kept whole, so the pass
+    /// tried again reuses what it stored. `survey`: taken already (for the ladder), with the graph.
+    func run(policy: RetentionPolicy, snapshots: [RepoSnapshotSummary], pressure: Pressure? = nil, collect: Bool,
+             protecting protected: Set<String> = [], survey taken: Survey? = nil, now: Date,
+             calendar: Calendar = .autoupdatingCurrent) async throws -> Outcome {
+        let hasSpaceRules = policy.maxTotalBytes > 0 || pressure != nil
+        let survey: Survey
+        if let taken { survey = taken } else { survey = try await self.survey(needsGraph: hasSpaceRules, needsIndex: collect) }
+        let present = survey.present, index = survey.index
+        var graph = survey.graph
         let listed = Set(present)
         let candidates = snapshots.filter { listed.contains($0.id) }
-        let hasSpaceRules = policy.maxTotalBytes > 0 || policy.minimumFreeBytes > 0
-        let index = hasSpaceRules || collect ? try await PackFormat.readIndex(backend: backend, cipher: cipher) : []
-        var graph = hasSpaceRules ? try await loadGraph(present, index: index) : nil
         let blocked = graph?.unreadable ?? []
         // The space rules need every snapshot's references.
         let decision = Self.plan(policy: policy, snapshots: candidates, graph: blocked.isEmpty ? graph : nil,
-                                 freeBytes: freeBytes, now: now, calendar: calendar)
+                                 pressureDrops: pressure?.drops, now: now, calendar: calendar)
 
         var outcome = Outcome(dropped: decision.drop)
         for id in decision.drop.sorted() { try await backend.delete(key: "snapshots/\(id)") }
@@ -100,77 +127,133 @@ struct RepoMaintenance: Sendable {
         guard collect || decision.spacePressure, outcome.unreadable.isEmpty else { return outcome }
         // Nothing kept: nothing to protect, and a listing that came back empty is no reason to delete everything.
         guard !kept.isEmpty else { return outcome }
-        if graph == nil { graph = try await loadGraph(kept, index: index) }
+        let packIndex = index.isEmpty ? try await PackFormat.readIndex(backend: backend, cipher: cipher) : index
+        if graph == nil { graph = try await loadGraph(kept, index: packIndex) }
         guard let graph else { return outcome }
         let unreadableKept = graph.unreadable.filter { kept.contains($0) }
         guard unreadableKept.isEmpty else {
             outcome.unreadable = unreadableKept
             return outcome
         }
-        outcome.reclaimedBytes = try await collectGarbage(graph: graph, kept: kept, index: index,
-                                                          repackAll: decision.spacePressure)
+        outcome.reclaimedBytes = try await collectGarbage(graph: graph, kept: kept, index: packIndex,
+                                                          repackAll: decision.spacePressure, protecting: protected)
         outcome.collected = true
         return outcome
+    }
+
+    /// The repo's side of a disk-wide reclamation (DiskSpace.Ladder): its garbage — what collecting now frees
+    /// with no snapshot lost, the snapshots the policy and the quota drop included — then what dropping each
+    /// of the oldest snapshots left would free, oldest first. nil when a snapshot cannot be read: what it
+    /// references is unknown, so nothing is counted on.
+    static func ladder(policy: RetentionPolicy, snapshots: [RepoSnapshotSummary], survey: Survey,
+                       protecting protected: Set<String> = [], now: Date,
+                       calendar: Calendar = .autoupdatingCurrent) -> (garbage: Int64, steps: [DiskSpace.Step])? {
+        guard let graph = survey.graph, graph.unreadable.isEmpty else { return nil }
+        let listed = Set(survey.present)
+        var thinning = Thinning(policy: policy, snapshots: snapshots.filter { listed.contains($0.id) }, graph: graph,
+                                now: now, calendar: calendar)
+        // What protected packs hold that nothing kept references stays: it is no garbage to count on.
+        var numbers: [Data: Int] = [:]
+        for (number, id) in graph.blobIDs.enumerated() { numbers[id] = number }
+        var kept: Int64 = 0
+        for pack in survey.index where protected.contains(pack.packID) {
+            for entry in pack.entries {
+                if let number = numbers[entry.blobID], thinning.references[number] == 0 { kept += Int64(entry.length) }
+            }
+        }
+        let garbage = max(0, thinning.garbage - kept)
+        var steps: [DiskSpace.Step] = []
+        while let step = thinning.dropOldest() { steps.append(step) }
+        return (garbage, steps)
     }
 
     // MARK: - Plan
 
     struct Decision: Equatable, Sendable {
         var drop: Set<String> = []
-        /// The quota is exceeded or free space is short (before dropping): collect, repacking fully.
+        /// The quota is exceeded or the disk is short of space (before dropping): collect, repacking fully.
         var spacePressure = false
     }
 
-    /// Which snapshots `policy` drops. Pure: `graph` tells what each frees (needed only for space rules).
+    /// Which snapshots `policy` drops — and, for a disk short of space, `pressureDrops` more of the oldest.
+    /// Pure: `graph` tells what each frees (needed only for the quota and the pressure drops).
     static func plan(policy: RetentionPolicy, snapshots: [RepoSnapshotSummary], graph: Graph?,
-                     freeBytes: Int64, now: Date, calendar: Calendar = .autoupdatingCurrent) -> Decision {
-        let ordered = snapshots.sorted { ($0.createdAt, $0.id) < ($1.createdAt, $1.id) }
-        guard !ordered.isEmpty else { return Decision() }
-        // 0) The history engine's cadence: a restore point at most every 15 minutes.
-        var dropped = Set(cadenceThinned(ordered).map(Int64.init))
-        // 1) Age/count policy over what is left — never the newest.
-        let survivors = ordered.indices.filter { !dropped.contains(Int64($0)) }
-        let thinned = HistoryRetention.thinned(
-            by: policy.mode,
-            items: survivors.enumerated().map {
-                .init(id: Int64($0.offset), time: Date(timeIntervalSince1970: ordered[$0.element].createdAt))
-            },
-            now: now, calendar: calendar)
-        for position in thinned where Int(position) < survivors.count - 1 { dropped.insert(Int64(survivors[Int(position)])) }
+                     pressureDrops: Int? = nil, now: Date, calendar: Calendar = .autoupdatingCurrent) -> Decision {
+        guard !snapshots.isEmpty else { return Decision() }
+        var thinning = Thinning(policy: policy, snapshots: snapshots, graph: graph, now: now, calendar: calendar)
         var decision = Decision()
+        if let graph {
+            // Pressure is what the disk says now: garbage not yet collected occupies it all the same.
+            decision.spacePressure = pressureDrops != nil
+                || (policy.maxTotalBytes > 0 && graph.packBytes > policy.maxTotalBytes)
+            for _ in 0..<max(0, pressureDrops ?? 0) {
+                guard thinning.dropOldest() != nil else { break }
+            }
+        }
+        decision.drop = Set(thinning.dropped.map { thinning.ordered[$0].id })
+        return decision
+    }
 
-        // 2) Space: the oldest kept go while the quota is exceeded or free space is short.
-        if let graph, policy.maxTotalBytes > 0 || policy.minimumFreeBytes > 0 {
-            var kept = ordered.indices.filter { !dropped.contains(Int64($0)) }
-            var references = [Int32](repeating: 0, count: graph.blobSizes.count)
+    /// Snapshots being thinned: the cadence and the policy (at init), then the quota, then — one by one — the
+    /// oldest kept, each time accounting for the blobs no kept snapshot references any more.
+    private struct Thinning {
+        let ordered: [RepoSnapshotSummary]
+        /// Positions in `ordered` dropped, and kept (ascending).
+        var dropped: Set<Int>
+        var kept: [Int]
+        let graph: Graph?
+        /// Per blob: how many kept snapshots reference it.
+        var references: [Int32] = []
+        /// Bytes of the blobs kept snapshots reference.
+        var usage: Int64 = 0
+
+        init(policy: RetentionPolicy, snapshots: [RepoSnapshotSummary], graph: Graph?, now: Date, calendar: Calendar) {
+            let ordered = snapshots.sorted { ($0.createdAt, $0.id) < ($1.createdAt, $1.id) }
+            self.ordered = ordered
+            self.graph = graph
+            // 0) The history engine's cadence: a restore point at most every 15 minutes.
+            var dropped = RepoMaintenance.cadenceThinned(ordered)
+            // 1) Age/count policy over what is left — never the newest.
+            let survivors = ordered.indices.filter { !dropped.contains($0) }
+            let thinned = HistoryRetention.thinned(
+                by: policy.mode,
+                items: survivors.enumerated().map {
+                    .init(id: Int64($0.offset), time: Date(timeIntervalSince1970: ordered[$0.element].createdAt))
+                },
+                now: now, calendar: calendar)
+            for position in thinned where Int(position) < survivors.count - 1 { dropped.insert(survivors[Int(position)]) }
+            self.dropped = dropped
+            kept = ordered.indices.filter { !dropped.contains($0) }
+            guard let graph else { return }
+            references = [Int32](repeating: 0, count: graph.blobSizes.count)
             for position in kept {
                 graph.blobs[ordered[position].id]?.forEach { references[$0] += 1 }
             }
-            var usage: Int64 = 0
             for (blob, count) in references.enumerated() where count > 0 { usage += graph.blobSizes[blob] }
-            // Pressure is what the disk says now: garbage not yet collected occupies it all the same.
-            decision.spacePressure = (policy.minimumFreeBytes > 0 && freeBytes < policy.minimumFreeBytes)
-                || (policy.maxTotalBytes > 0 && graph.packBytes > policy.maxTotalBytes)
-            // What to drop is judged on what the collection leaves: garbage is reclaimed with it.
-            var free = saturatingAdd(freeBytes, max(0, graph.packBytes - usage))
-            func pressed() -> Bool {
-                (policy.minimumFreeBytes > 0 && free < policy.minimumFreeBytes)
-                    || (policy.maxTotalBytes > 0 && usage > policy.maxTotalBytes)
-            }
-            while kept.count > 1, pressed() {
-                let oldest = kept.removeFirst()
-                dropped.insert(Int64(oldest))
-                var freed: Int64 = 0
+            // 2) Quota — judged on what the collection leaves: garbage is reclaimed with it.
+            while policy.maxTotalBytes > 0, usage > policy.maxTotalBytes, dropOldest() != nil {}
+        }
+
+        /// What collecting now frees with no further snapshot dropped.
+        var garbage: Int64 {
+            graph.map { max(0, $0.packBytes - usage) } ?? 0
+        }
+
+        /// Drop the oldest kept snapshot — never the last one — and say what that frees.
+        mutating func dropOldest() -> DiskSpace.Step? {
+            guard kept.count > 1 else { return nil }
+            let oldest = kept.removeFirst()
+            dropped.insert(oldest)
+            var freed: Int64 = 0
+            if let graph {
                 graph.blobs[ordered[oldest].id]?.forEach { blob in
                     references[blob] -= 1
                     if references[blob] == 0 { freed += graph.blobSizes[blob] }
                 }
-                usage -= freed
-                free = saturatingAdd(free, freed)
             }
+            usage -= freed
+            return DiskSpace.Step(time: Date(timeIntervalSince1970: ordered[oldest].createdAt), freed: freed)
         }
-        decision.drop = Set(dropped.map { ordered[Int($0)].id })
-        return decision
     }
 
     /// The history engine's cadence (docs §3.3): of the snapshots passes wrote, kept are the first once
@@ -189,10 +272,6 @@ struct RepoMaintenance: Sendable {
             if exempt || stood || spaced { lastKept = snapshot.createdAt } else { dropped.insert(index) }
         }
         return dropped
-    }
-
-    private static func saturatingAdd(_ a: Int64, _ b: Int64) -> Int64 {
-        a > Int64.max - b ? Int64.max : a + b
     }
 
     // MARK: - Graph
@@ -282,9 +361,10 @@ struct RepoMaintenance: Sendable {
 
     // MARK: - Collect
 
-    /// Delete what the `kept` snapshots do not reference; returns the pack bytes reclaimed.
+    /// Delete what the `kept` snapshots do not reference — except the `protected` packs, kept whole; returns
+    /// the pack bytes reclaimed.
     private func collectGarbage(graph: Graph, kept: [String], index: [PackFormat.IndexedPack],
-                                repackAll: Bool) async throws -> Int64 {
+                                repackAll: Bool, protecting protected: Set<String>) async throws -> Int64 {
         var liveBlobs = Bitset()
         var liveTrees = Bitset()
         for id in kept {
@@ -300,7 +380,13 @@ struct RepoMaintenance: Sendable {
         var rewritten: [PackFormat.IndexedPack] = []
         var moving: [(pack: String, entry: PackEntry)] = []
         var reclaimed: Int64 = 0
-        for pack in index.sorted(by: { $0.packID < $1.packID }) {
+        // A protected pack keeps every blob in it: a copy of one elsewhere is the spare.
+        for pack in index where protected.contains(pack.packID) {
+            for entry in pack.entries {
+                if let number = blobNumbers[entry.blobID] { _ = placed.insert(number) }
+            }
+        }
+        for pack in index.sorted(by: { $0.packID < $1.packID }) where !protected.contains(pack.packID) {
             var live: [PackEntry] = []
             var total = 0, dead = 0
             for entry in pack.entries {

@@ -10,7 +10,8 @@
 //               05:00 day boundary follows the wall clock across daylight saving; a migration never
 //               discards history it could not read; a published tree whose row failed is adopted; a
 //               migration request is not left behind; and a copy whose source changed while it was copied
-//               is never recorded, while a file that never stops changing is still backed up.
+//               is never recorded, while a file that never stops changing is still backed up; and what a
+//               pass that never finished left in current/ is never sealed as an earlier state.
 //  @author      Kennt Kim
 //  @company     Calida Lab
 //  @created     2026-09-19
@@ -227,6 +228,19 @@ final class HistorySafetyTests: XCTestCase {
     }
 
     // MARK: - Reaper, NAS lock, day boundary
+
+    func testAPassThatNeverFinishedLeavesNoRestorePointOfWhatItLeft() throws {
+        try fixture.write("a.txt", "one")
+        try fixture.pass(at: 0)                         // sealed: the first state
+        try fixture.write("a.txt", "two")
+        try fixture.pass(at: 5)                         // within the spacing: left unsealed, ended at minute 5
+        // The next pass began changing current/ and died between batches — no intent left to recover.
+        try fixture.store().beginPass()
+
+        let outcome = try fixture.pass(at: 20)
+        XCTAssertEqual(outcome.sealed.map(\.time), [fixture.time(20)],
+                       "sealed at the end of a pass that finished, never as of minute 5")
+    }
 
     func testTheReaperReportsWhatItIsAboutToFree() {
         let queue = DispatchQueue(label: "test.reaper")

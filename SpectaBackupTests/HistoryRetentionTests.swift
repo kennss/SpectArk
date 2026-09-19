@@ -2,7 +2,8 @@
 //  @file        HistoryRetentionTests.swift
 //  @description History engine, phase 2 — retention. Planner: Time Machine thinning of checkpoints (same
 //               rules as legacy snapshots), the newest checkpoint always kept, versions pruned exactly
-//               when no kept checkpoint needs them, space pressure and quota dropping the oldest first,
+//               when no kept checkpoint needs them, the quota and disk pressure dropping the oldest first
+//               (the ladder a disk plans with says what each frees),
 //               and (phase 4) legacy snapshots and checkpoints thinned as one timeline. Days are local
 //               and begin at 05:00.
 //               Maintenance on a real history: files leave versions/, current/ is untouched, an
@@ -47,7 +48,7 @@ final class HistoryRetentionTests: XCTestCase {
             checkpoint(6, ageHours: 1)               // newest
         ]
         let plan = HistoryRetention.plan(policy: .automatic, checkpoints: checkpoints, versions: [],
-                                         currentBytes: 0, freeBytes: .max, now: now, calendar: utc)
+                                         currentBytes: 0, now: now, calendar: utc)
         XCTAssertEqual(plan.checkpoints, [1, 3])
     }
 
@@ -61,16 +62,16 @@ final class HistoryRetentionTests: XCTestCase {
             checkpoint(5, ageHours: 1)
         ]
         let plan = HistoryRetention.plan(policy: .automatic, checkpoints: checkpoints, versions: [],
-                                         currentBytes: 0, freeBytes: .max, now: now, calendar: utc)
+                                         currentBytes: 0, now: now, calendar: utc)
         XCTAssertEqual(plan.checkpoints, [1, 2], "May 5 keeps its newest (04:59); 05:01 starts May 6")
     }
 
     func testNewestCheckpointIsNeverDropped() {
         let checkpoints = [checkpoint(1, ageHours: 3), checkpoint(2, ageHours: 2), checkpoint(3, ageHours: 1)]
-        let plan = HistoryRetention.plan(policy: RetentionPolicy(mode: .keepCount(1), minimumFreeBytes: .max),
+        let plan = HistoryRetention.plan(policy: RetentionPolicy(mode: .keepCount(1)),
                                          checkpoints: checkpoints, versions: [],
-                                         currentBytes: 0, freeBytes: 0, now: now)
-        XCTAssertEqual(plan.checkpoints, [1, 2], "even under impossible space pressure")
+                                         currentBytes: 0, pressureDrops: 10, now: now)
+        XCTAssertEqual(plan.checkpoints, [1, 2], "even when the disk asks for more than there is")
     }
 
     func testVersionsArePrunedExactlyWhenNoKeptCheckpointNeedsThem() {
@@ -79,25 +80,45 @@ final class HistoryRetentionTests: XCTestCase {
                         span(11, 1, 3),   // checkpoints 1–2
                         span(12, 2, 4)]   // checkpoints 2–3
         let plan = HistoryRetention.plan(policy: RetentionPolicy(mode: .keepCount(1)), checkpoints: checkpoints,
-                                         versions: versions, currentBytes: 0, freeBytes: .max, now: now)
+                                         versions: versions, currentBytes: 0, now: now)
         XCTAssertEqual(plan.checkpoints, [1, 2])
         XCTAssertEqual(plan.versions, [10, 11], "12 still makes up checkpoint 3")
     }
 
-    func testSpacePressureDropsOldestUntilThereIsRoom() {
+    func testTheLadderSaysWhatEachOldestRestorePointFrees() {
+        let checkpoints = [checkpoint(1, ageHours: 3), checkpoint(2, ageHours: 2), checkpoint(3, ageHours: 1)]
+        let versions = [span(10, 1, 2, size: 30), span(11, 2, 3, size: 20), span(12, 1, 3, size: 5)]
+        let ladder = HistoryRetention.ladder(policy: .automatic, checkpoints: checkpoints, versions: versions,
+                                             currentBytes: 0, now: now)
+        XCTAssertEqual(ladder.map(\.freed), [30, 25], "then 11, and 12 once nothing kept needs it; never the newest")
+        XCTAssertEqual(ladder.map(\.time), [checkpoints[0].time, checkpoints[1].time])
+    }
+
+    func testPressureDropsTheOldestAsManyAsAskedFor() {
         let checkpoints = [checkpoint(1, ageHours: 3), checkpoint(2, ageHours: 2), checkpoint(3, ageHours: 1)]
         let versions = [span(10, 1, 2, size: 30), span(11, 2, 3, size: 30)]
-        let policy = RetentionPolicy(mode: .automatic, minimumFreeBytes: 100)
+        let one = HistoryRetention.plan(policy: .automatic, checkpoints: checkpoints, versions: versions,
+                                        currentBytes: 0, pressureDrops: 1, now: now)
+        XCTAssertEqual(one.checkpoints, [1])
+        XCTAssertEqual(one.versions, [10])
+        let two = HistoryRetention.plan(policy: .automatic, checkpoints: checkpoints, versions: versions,
+                                        currentBytes: 0, pressureDrops: 2, now: now)
+        XCTAssertEqual(two.checkpoints, [1, 2])
+        XCTAssertEqual(two.versions, [10, 11])
+    }
 
-        let tight = HistoryRetention.plan(policy: policy, checkpoints: checkpoints, versions: versions,
-                                          currentBytes: 0, freeBytes: 50, now: now)
-        XCTAssertEqual(tight.checkpoints, [1, 2], "50 + 30 is still short; 50 + 60 is enough")
-        XCTAssertEqual(tight.versions, [10, 11])
-
-        let roomy = HistoryRetention.plan(policy: policy, checkpoints: checkpoints, versions: versions,
-                                          currentBytes: 0, freeBytes: 80, now: now)
-        XCTAssertEqual(roomy.checkpoints, [1])
-        XCTAssertEqual(roomy.versions, [10])
+    func testTheLadderStartsAfterWhatThePolicyAndTheQuotaDrop() {
+        let checkpoints = [checkpoint(1, ageHours: 4), checkpoint(2, ageHours: 3), checkpoint(3, ageHours: 2),
+                           checkpoint(4, ageHours: 1)]
+        let versions = [span(10, 1, 2, size: 10), span(11, 2, 3, size: 20), span(12, 3, 4, size: 40)]
+        let ladder = HistoryRetention.ladder(policy: RetentionPolicy(mode: .keepCount(3), maxTotalBytes: 50),
+                                             checkpoints: checkpoints, versions: versions, currentBytes: 0, now: now)
+        // keepCount drops 1; the quota (20 + 40 > 50) drops 2; left before the newest: 3, with version 12.
+        XCTAssertEqual(ladder.map(\.freed), [40])
+        let plan = HistoryRetention.plan(policy: RetentionPolicy(mode: .keepCount(3), maxTotalBytes: 50),
+                                         checkpoints: checkpoints, versions: versions, currentBytes: 0,
+                                         pressureDrops: 1, now: now)
+        XCTAssertEqual(plan.checkpoints, [1, 2, 3])
     }
 
     func testQuotaCountsCurrentPlusNeededVersions() {
@@ -105,11 +126,11 @@ final class HistoryRetentionTests: XCTestCase {
         let versions = [span(10, 1, 2, size: 40)]
         let policy = RetentionPolicy(mode: .automatic, maxTotalBytes: 120)
         let over = HistoryRetention.plan(policy: policy, checkpoints: checkpoints, versions: versions,
-                                         currentBytes: 100, freeBytes: .max, now: now)
+                                         currentBytes: 100, now: now)
         XCTAssertEqual(over.checkpoints, [1])
         XCTAssertEqual(over.versions, [10])
         let under = HistoryRetention.plan(policy: policy, checkpoints: checkpoints, versions: versions,
-                                          currentBytes: 80, freeBytes: .max, now: now)
+                                          currentBytes: 80, now: now)
         XCTAssertTrue(under.checkpoints.isEmpty && under.versions.isEmpty)
     }
 
@@ -124,19 +145,21 @@ final class HistoryRetentionTests: XCTestCase {
                                          checkpoints: [checkpoint(1, ageHours: 2), checkpoint(2, ageHours: 1)],
                                          versions: [], currentBytes: 0,
                                          legacy: [legacy(7, ageHours: 30), legacy(8, ageHours: 20), legacy(9, ageHours: 10)],
-                                         freeBytes: .max, now: now)
+                                         now: now)
         XCTAssertEqual(plan.legacySnapshots, [7, 8], "the three newest restore points stay: 9, 1, 2")
         XCTAssertTrue(plan.checkpoints.isEmpty)
     }
 
     func testSpacePressureDropsLegacySnapshotsFirst() {
-        let policy = RetentionPolicy(mode: .automatic, minimumFreeBytes: 250)
-        let plan = HistoryRetention.plan(policy: policy,
-                                         checkpoints: [checkpoint(1, ageHours: 2), checkpoint(2, ageHours: 1)],
-                                         versions: [span(10, 1, 2, size: 1_000)], currentBytes: 0,
-                                         legacy: [legacy(7, ageHours: 5), legacy(8, ageHours: 4)],
-                                         freeBytes: 100, now: now)
-        XCTAssertEqual(plan.legacySnapshots, [7, 8], "100 + 100 is short, + 100 is enough")
+        let checkpoints = [checkpoint(1, ageHours: 2), checkpoint(2, ageHours: 1)]
+        let versions = [span(10, 1, 2, size: 1_000)]
+        let old = [legacy(7, ageHours: 5), legacy(8, ageHours: 4)]
+        let ladder = HistoryRetention.ladder(policy: .automatic, checkpoints: checkpoints, versions: versions,
+                                             currentBytes: 0, legacy: old, now: now)
+        XCTAssertEqual(ladder.map(\.freed), [100, 100, 1_000])
+        let plan = HistoryRetention.plan(policy: .automatic, checkpoints: checkpoints, versions: versions,
+                                         currentBytes: 0, legacy: old, pressureDrops: 2, now: now)
+        XCTAssertEqual(plan.legacySnapshots, [7, 8])
         XCTAssertTrue(plan.checkpoints.isEmpty)
         XCTAssertTrue(plan.versions.isEmpty)
     }
@@ -146,15 +169,15 @@ final class HistoryRetentionTests: XCTestCase {
         let policy = RetentionPolicy(mode: .keepAll, maxTotalBytes: 150)
         let plan = HistoryRetention.plan(policy: policy, checkpoints: [checkpoint(1, ageHours: 1)], versions: [],
                                          currentBytes: 100, seededBytes: 100,
-                                         legacy: [legacy(7, ageHours: 5, bytes: 100)], freeBytes: .max, now: now)
+                                         legacy: [legacy(7, ageHours: 5, bytes: 100)], now: now)
         XCTAssertTrue(plan.legacySnapshots.isEmpty, "100 bytes on disk, not 200")
     }
 
     func testTheNewestLegacySnapshotStaysWhileThereIsNoCheckpoint() {
-        let plan = HistoryRetention.plan(policy: RetentionPolicy(mode: .keepCount(1), minimumFreeBytes: .max),
+        let plan = HistoryRetention.plan(policy: RetentionPolicy(mode: .keepCount(1)),
                                          checkpoints: [], versions: [], currentBytes: 0,
                                          legacy: [legacy(7, ageHours: 5), legacy(8, ageHours: 4)],
-                                         freeBytes: 0, now: now)
+                                         pressureDrops: 5, now: now)
         XCTAssertEqual(plan.legacySnapshots, [7])
     }
 
@@ -181,7 +204,7 @@ final class HistoryRetentionTests: XCTestCase {
         XCTAssertEqual(stored.count, 2)
 
         let result = try HistoryMaintenance(layout: fixture.layout)
-            .applyRetention(policy: RetentionPolicy(mode: .keepCount(1)), freeBytes: .max, now: fixture.time(40))
+            .applyRetention(policy: RetentionPolicy(mode: .keepCount(1)), now: fixture.time(40))
         XCTAssertEqual(result.checkpointsDeleted, 2)
         XCTAssertEqual(result.versionsDeleted, 2)
         XCTAssertEqual(result.bytesFreed, 5)
@@ -203,7 +226,7 @@ final class HistoryRetentionTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: orphan))
 
         _ = try HistoryMaintenance(layout: fixture.layout)
-            .applyRetention(policy: .automatic, freeBytes: .max, now: fixture.time(40))
+            .applyRetention(policy: .automatic, now: fixture.time(40))
         XCTAssertFalse(FileManager.default.fileExists(atPath: orphan), "swept")
         XCTAssertTrue(FileManager.default.fileExists(atPath: fixture.layout.version(try XCTUnwrap(versions[1].stored))),
                       "a referenced version is never swept")
@@ -218,7 +241,7 @@ final class HistoryRetentionTests: XCTestCase {
         XCTAssertThrowsError(try fixture.pass(at: 50, engine: crashing))
 
         let result = try HistoryMaintenance(layout: fixture.layout)
-            .applyRetention(policy: RetentionPolicy(mode: .keepCount(1)), freeBytes: .max, now: fixture.time(51))
+            .applyRetention(policy: RetentionPolicy(mode: .keepCount(1)), now: fixture.time(51))
         XCTAssertTrue(result.skippedForPendingIntents)
         try fixture.pass(at: 52)                                   // recovery keeps v3 as a version
         XCTAssertEqual(try fixture.files(at: 3)["src/a.txt"], "v3--")

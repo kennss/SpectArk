@@ -9,9 +9,10 @@
 //  @lastUpdated 2026-09-19
 //
 //  Notes:
-//  - Free-space decisions must be driven by live `statfs` at thinning time, NOT by summing backup
-//    sizes. `minimumFreeBytes` is the low-water mark that forces deletion of the oldest restore points
-//    regardless of age policy; the newest one is never deleted.
+//  - Free space is kept per disk, not per job (DiskSpace): every disk keeps 5% free — or the largest
+//    `minimumFreeBytes` a job on it sets — by deleting the oldest restore points of all its jobs together,
+//    regardless of age policy; each job's newest one is never deleted. Measured with live `statfs`, NOT
+//    by summing backup sizes. "Keep all" jobs give up nothing for space unless they set it themselves.
 //
 
 import Foundation
@@ -24,12 +25,14 @@ struct RetentionPolicy: Codable, Sendable, Hashable {
         case keepCount(Int)
         /// Keep restore points created within the last N days.
         case keepDays(Int)
-        /// Never auto-delete; stop backing up (and warn) when the disk fills.
+        /// Never auto-delete — not even for space, unless `minimumFreeBytes` is set; backups stop (with an
+        /// error) when the disk fills.
         case keepAll
     }
 
     var mode: Mode
-    /// Low-water free-space mark in bytes that forces oldest-first deletion (0 = disabled).
+    /// Free space in bytes to keep on the backup disk, deleting the oldest restore points there when less is
+    /// free (0 = automatic: 5% of the disk). The largest value among a disk's jobs is the disk's.
     var minimumFreeBytes: Int64
     /// Maximum total bytes the backup may occupy (quota — e.g. a NAS share allowance); 0 = unlimited.
     /// When exceeded, the oldest restore points are deleted first.

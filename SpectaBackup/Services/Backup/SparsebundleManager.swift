@@ -19,7 +19,9 @@
 //    It records the writer's PID, start time and host UUID, so a lock left by a crash is recognised
 //    as stale even after a reboot hands its PID to another process.
 //  - Deleting files inside the image does NOT shrink it (APFS in a sparsebundle returns no bands on its
-//    own — measured): `detach(_:reclaim:)` compacts it, or removes it when nothing in it is kept.
+//    own — measured): `detach(_:reclaim:)` compacts it, or removes it when nothing in it is kept (renamed
+//    away, then deleted in the background). Quit and sleep cancel compactions under way and wait for their
+//    locks to be released (`stopCompactions`): `hdiutil compact` cancels cleanly on SIGINT (measured).
 //  - The app reads (timeline, browse, restore) through the same read-write attachment a pass uses
 //    (ImageLease): attaching an image that is attached already only returns the existing mount.
 //
@@ -197,11 +199,13 @@ struct SparsebundleManager: Sendable {
         let wasAttached = isAttached(attachment)
         guard detachVolume(attachment) else { return .refused }
         attachments.remove(attachment)
+        let reclaiming = reclaims.begin()
+        defer { reclaims.end(reclaiming) }   // after the lock is released (defers run last-declared first)
         defer { if let lock = attachment.lockURL { release(lock) } }
         switch reclaim {
         case .compact:
             do {
-                try run(["compact", attachment.imageURL.path, "-batteryallowed"])
+                try run(["compact", attachment.imageURL.path, "-batteryallowed"], reclaiming: reclaiming)
             } catch {
                 return .failed("\(error)")
             }
@@ -214,10 +218,24 @@ struct SparsebundleManager: Sendable {
             } catch {
                 return .failed("\(error)")
             }
-            try? FileManager.default.removeItem(at: removing)
+            // Renamed away, it is garbage by name: deleted in the background, holding up nothing — not the
+            // lock, not a quit.
+            TreeReaper.shared.reap(removing)
         }
         return .reclaimed
     }
+
+    /// Stop the compactions under way — `hdiutil compact` cancels cleanly on SIGINT (measured: interrupted
+    /// at several points, the container checks out and every file reads back) — and wait, at most `timeout`
+    /// seconds, until each has let go of its image and its lock. `forGood` (quitting): no compaction starts
+    /// any more; otherwise (sleep) the next one may. A quit that left `hdiutil compact` running would leave it
+    /// holding the image with nothing holding the lock, and the next launch attaching it meanwhile.
+    static func stopCompactions(timeout: TimeInterval, forGood: Bool) {
+        reclaims.stop(timeout: timeout, forGood: forGood)
+    }
+
+    /// Reclaims under way (between a detach and the release of its lock).
+    private static let reclaims = ReclaimRegistry()
 
     /// Images a removal left behind at `destination` (renamed away, not fully deleted): deleted in the
     /// background. Nothing attaches them — they are garbage by name.
@@ -328,15 +346,18 @@ struct SparsebundleManager: Sendable {
         return UUID(uuid: uuid).uuidString
     }
 
+    /// `reclaiming`: the reclaim this command belongs to, so stopping reclaims interrupts it.
     @discardableResult
-    private static func run(_ args: [String]) throws -> Data {
+    private static func run(_ args: [String], reclaiming: UUID? = nil) throws -> Data {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/hdiutil")
         process.arguments = args
         let outPipe = Pipe(), errPipe = Pipe()
         process.standardOutput = outPipe
         process.standardError = errPipe
+        if let reclaiming, !reclaims.mayStart(reclaiming) { throw SBError.command(args.first ?? "", -1, "stopped") }
         try process.run()
+        if let reclaiming { reclaims.running(process, for: reclaiming) }
         process.waitUntilExit()
         let data = outPipe.fileHandleForReading.readDataToEndOfFile()
         guard process.terminationStatus == 0 else {
@@ -358,6 +379,49 @@ final class LockRegistry: @unchecked Sendable {
 }
 
 /// A thread-safe set of attachments.
+/// Reclaims under way: the `hdiutil` each runs, and a way to wait for all of them to end.
+final class ReclaimRegistry: @unchecked Sendable {
+    private let lock = NSLock()
+    private var processes: [UUID: Process] = [:]
+    private var open = Set<UUID>()
+    private var stopped = false
+    private let group = DispatchGroup()
+
+    func begin() -> UUID {
+        let id = UUID()
+        lock.lock(); open.insert(id); lock.unlock()
+        group.enter()
+        return id
+    }
+
+    func end(_ id: UUID) {
+        lock.lock(); processes[id] = nil; open.remove(id); lock.unlock()
+        group.leave()
+    }
+
+    /// Whether a command of `id` may start (none after a stop for good).
+    func mayStart(_ id: UUID) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return !stopped
+    }
+
+    /// `process` runs for `id`: interrupted at once if a stop came meanwhile.
+    func running(_ process: Process, for id: UUID) {
+        lock.lock(); defer { lock.unlock() }
+        processes[id] = process
+        if stopped { process.interrupt() }
+    }
+
+    func stop(timeout: TimeInterval, forGood: Bool) {
+        lock.lock()
+        stopped = true
+        for process in processes.values where process.isRunning { process.interrupt() }
+        lock.unlock()
+        _ = group.wait(timeout: .now() + timeout)
+        if !forGood { lock.lock(); stopped = false; lock.unlock() }
+    }
+}
+
 final class AttachmentRegistry: @unchecked Sendable {
     private let lock = NSLock()
     private var items = Set<SparsebundleManager.Attachment>()

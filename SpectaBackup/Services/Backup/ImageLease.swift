@@ -158,6 +158,13 @@ final class ImageLease: @unchecked Sendable {
         if users == 0 { queue.async { self.reclaim() } }
     }
 
+    /// `requestReclaim`, waited for: the image's free space is back on the share when this returns — unless
+    /// something else uses the image; then it is once that lets go.
+    func reclaimNow() {
+        requestReclaim()
+        queue.sync {}
+    }
+
     /// Detach now if nothing uses the image — and, with `generation`, nothing acquired it since the timer
     /// was armed.
     func detachIfIdle(generation armed: Int? = nil) {

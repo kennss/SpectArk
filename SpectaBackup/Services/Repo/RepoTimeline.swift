@@ -22,9 +22,10 @@
 //    be decrypted is left out, never cached, and hides nothing else.
 //  - Snapshot IDs: "<ms since 1970>-<8 hex>" — unique without a catalog to number them. Repos from before
 //    keep their "enc-<n>" IDs.
-//  - The cache also keeps when the repo's garbage was last collected (RepoMaintenance runs it daily) and
-//    where the next pass starts (EncryptedCaptureState: its parent snapshot and journal cursors). Losing it
-//    costs one full walk, never data: the parent is checked to still exist in the repo.
+//  - The cache also keeps when the repo's garbage was last collected (RepoMaintenance runs it daily),
+//    where the next pass starts (EncryptedCaptureState: its parent snapshot and journal cursors), and what
+//    the repo's packs occupy — measured when a pass or a space reclamation ends, so showing it lists nothing
+//    at the destination. Losing it costs one full walk, never data: the parent is checked to still exist.
 //
 
 import CryptoKit
@@ -173,6 +174,16 @@ struct RepoTimeline: Sendable {
         }
     }
 
+    /// What the job's repo occupies, as last measured (the timeline's footprint; nil before any pass).
+    func storedBytes(_ jobID: UUID) -> Int64? {
+        load(jobID)?.storedBytes
+    }
+
+    /// Remember what the repo (`repo`: its identity) occupies now.
+    func recordStoredBytes(_ jobID: UUID, repo: String, _ bytes: Int64) {
+        update(jobID, repo: repo) { $0.storedBytes = bytes }
+    }
+
     /// Forget a job's cache (its backups were removed).
     func forget(_ jobID: UUID) {
         Self.locked { try? FileManager.default.removeItem(at: file(for: jobID)) }
@@ -188,6 +199,8 @@ struct RepoTimeline: Sendable {
         var lastCollection: Double?
         /// Where the next pass starts.
         var capture: EncryptedCaptureState?
+        /// What the repo's packs occupy (bytes), as last measured — after a pass, or after room was made.
+        var storedBytes: Int64?
     }
 
     private func file(for jobID: UUID) -> URL {

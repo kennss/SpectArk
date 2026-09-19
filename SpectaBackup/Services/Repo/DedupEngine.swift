@@ -50,6 +50,11 @@ struct DedupEngine: Sendable {
     }
 
     /// Load the blob index (needed before restoring into a freshly-opened engine).
+    /// Packs this engine's passes wrote (BlobStore.packsWritten).
+    func packsWritten() async -> Set<String> {
+        await blobStore.packsWritten
+    }
+
     func open() async throws {
         try await blobStore.loadIndex()
     }
