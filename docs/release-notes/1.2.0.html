@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<!--
+  @file        1.2.0.html
+  @description Sparkle in-app release notes for SpectArk 1.2.0. Bundled into the appcast by
+               scripts/release.sh (copied next to the DMG as SpectArk-1.2.0.html so generate_appcast
+               attaches it). Rendered in the "Update Available" panel; styled for light and dark.
+               The full list is in CHANGELOG.md.
+  @author      Kennt Kim
+  @company     Calida Lab
+  @created     2026-09-19
+  @lastUpdated 2026-09-19
+-->
+<html>
+<head>
+<meta charset="utf-8" />
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    font: 13px -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif;
+    line-height: 1.5; margin: 0; padding: 14px 16px;
+    color: #1d1d1f; background: transparent;
+  }
+  h1 { font-size: 15px; font-weight: 700; margin: 0 0 4px; }
+  h2 { font-size: 13px; font-weight: 700; margin: 14px 0 6px; }
+  .sub { color: #86868b; font-size: 12px; margin: 0 0 12px; }
+  ul { margin: 0; padding-left: 18px; }
+  li { margin-bottom: 9px; }
+  b { font-weight: 600; }
+  @media (prefers-color-scheme: dark) {
+    body { color: #f5f5f7; }
+    .sub { color: #98989d; }
+  }
+</style>
+</head>
+<body>
+  <h1>SpectArk 1.2.0</h1>
+  <p class="sub">A new backup engine, NAS timelines, and a disk that never fills up</p>
+  <ul>
+    <li><b>Every change protected within seconds, a restore point at most every 15 minutes.</b>
+        Only the files that changed are copied, found through the macOS file-system journal —
+        including changes made while SpectArk was not running. Like Time Machine, the last 24 hours
+        are kept whole, then one restore point per day for a month and one per week after that.
+        Your existing backups carry over on the first run.</li>
+    <li><b>A full backup disk makes room by deleting its oldest backups.</b> Every backup disk keeps
+        5% free (or what you set in "Keep free space"); when it runs short, the oldest restore points
+        on it go first, across all the backups there. A backup that runs out of room carries on
+        instead of failing again and again.</li>
+    <li><b>NAS backups show their timeline and restore in the app</b>, give space back on the NAS as
+        old versions are thinned, and never write more than the share can hold.</li>
+    <li><b>Destinations are found wherever macOS mounts them</b> — a share remounted as
+        "home-1" or a drive back as "Backup 1" resumes on its own.</li>
+    <li><b>Encrypted backups are incremental and thinned like the others</b>, and restore each
+        file's modification time.</li>
+    <li><b>Open at login</b>: after a restart SpectArk starts quietly in the menu bar and realtime
+        backup simply continues.</li>
+    <li><b>Skip rebuildable files</b> (on by default): dependency folders, build outputs and caches
+        are left out when the tool that owns them is recognized.</li>
+  </ul>
+  <h2>Also fixed</h2>
+  <ul>
+    <li>A file changed while it was being copied is never recorded half-written.</li>
+    <li>Realtime backup no longer runs non-stop on developer folders, and no change is left
+        un-backed-up.</li>
+    <li>A file locked in Finder no longer stops a backup; NAS backups no longer stop for good after
+        a crash.</li>
+  </ul>
+</body>
+</html>

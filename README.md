@@ -48,16 +48,24 @@ they go.
 
 ## Features
 
-- **Versioned snapshots** (Time Machine style): point-in-time snapshots, unchanged
-  data shared via APFS clones / hardlinks.
-- **Realtime or scheduled** per backup — watch a folder live (FSEvents) and snapshot on
-  change, or run on an interval.
+- **Continuous protection with Time Machine–style restore points**: every change is backed up
+  within seconds, and a restore point is kept at most every 15 minutes — all of the last 24 hours,
+  one per day for a month, one per week after that. Only changed files are copied; which folders
+  changed comes from the macOS file-system journal, including changes made while SpectArk was not
+  running.
+- **Realtime or scheduled** per backup — watch a folder live, or run on an interval.
 - **Multiple source folders**, each paired with any destination you choose.
-- **Local disk or NAS** destinations, with strategy auto-detected per destination.
+- **Local disk or NAS** destinations. A NAS backup lives in a disk image on the share, with its
+  full timeline and restore in the app; destinations are found wherever macOS mounts them.
+- **Keeps room on the backup disk**: 5% of every backup disk stays free (or what you set); when
+  it runs short, the disk's oldest restore points go first, across all the backups on it.
 - **Optional encryption**: content-defined chunking + dedup, AES-256-GCM with
-  argon2id-derived keys, and a one-time recovery key. Off by default (snapshots
+  argon2id-derived keys, and a one-time recovery key. Off by default (backups
   stay browsable plaintext).
-- **Dashboard window + menu-bar dropdown** (live throughput, free space, last backup).
+- **Skips rebuildable files** (dependency folders, build outputs, caches) — only when the tool
+  that owns them is recognized.
+- **Dashboard window + menu-bar dropdown** (live throughput, free space, last backup); opens
+  quietly at login.
 - Non-sandboxed, Developer ID distribution. macOS 14+.
 
 ## Build
@@ -84,11 +92,15 @@ Access carry over across the rename; the built app is `SpectArk.app`.
 
 ## Data integrity
 
-The backup engine is built on macOS primitives chosen for correctness:
-APFS source snapshots (consistent reads), `clonefile`/`copyfile`, atomic
-`rename` publish with a `COMPLETE` marker, and a SQLite catalog with
-`F_FULLFSYNC` durability. See [`docs/ENCRYPTION_DESIGN.md`](docs/ENCRYPTION_DESIGN.md)
-for the encrypted-repo design.
+The backup engine is built on macOS primitives chosen for correctness: every change is logged
+as an intent in a SQLite catalog before it touches the disk, so an interrupted pass is repaired
+on the next one; copies are `fsync`ed and put in place with an atomic `rename`, and the catalog
+commits with `F_FULLFSYNC`; every copy is checked against its source and dropped if the file
+changed while it was read, so a file is never recorded half-written. Files that must agree with
+each other (a database and its `-wal`) are copied one after another, not at one instant — a
+source snapshot would need root and an Apple-granted entitlement (see [TODO.md](TODO.md)).
+See [`docs/INCREMENTAL_ENGINE_DESIGN.md`](docs/INCREMENTAL_ENGINE_DESIGN.md) for the backup
+engine and [`docs/ENCRYPTION_DESIGN.md`](docs/ENCRYPTION_DESIGN.md) for the encrypted repo.
 
 ## Roadmap
 

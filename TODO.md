@@ -16,10 +16,14 @@ is a known bug — these are enhancements.
   (every copy is checked against its source and dropped if the source moved while it was copied),
   but files that must agree with each other — a SQLite database and its `-wal`, a Git operation in
   progress — are still copied one after another, not at one instant. The fully-correct fix is to
-  snapshot the source volume (`fs_snapshot_*`) and read from the frozen view. That call needs root, so it requires a privileged helper (`SMAppService`
-  daemon). The engine already abstracts this behind `SourceReadSession` (currently a
-  coordinated read + quiet-window), so swapping in a real snapshot session later is not a
-  rewrite.
+  snapshot the source volume (`fs_snapshot_*`) and read from the frozen view. Those calls need root
+  *and* an entitlement Apple grants on request (fs_snapshot_create(2)), so this takes a privileged
+  helper (`SMAppService` daemon) and Apple's approval — worth it for public guarantees or live
+  databases, not for source folders like the current ones (checked 2026-09-19: no live databases;
+  Git writes objects before refs, and passes start after changes settle). The engine already
+  abstracts reads behind `SourceReadSession`, so a snapshot session later is not a rewrite.
+  A step that needs neither: copy a SQLite file with its `-wal`/`-shm` as one set, checked unchanged
+  across the whole set's copy.
 
 ## P3 — Encrypted repo completeness
 

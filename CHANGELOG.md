@@ -6,6 +6,8 @@ All notable changes to SpectArk are documented here. The format follows
 
 ## [Unreleased]
 
+## [1.2.0] — 2026-09-19
+
 ### Changed
 - **A full backup disk makes room by deleting its oldest backups, as Time Machine does.** Every backup disk
   now keeps 5% of itself free (or what you set in "Keep free space"); when less is free, the oldest restore
@@ -230,6 +232,7 @@ the bundle id and existing backups carry over).
 - Dashboard window + menu-bar dropdown with live throughput and free space.
 - Developer ID signed and notarized; universal (Apple Silicon + Intel), macOS 14+.
 
+[1.2.0]: https://github.com/kennss/SpectArk/releases/tag/v1.2.0
 [1.1.4]: https://github.com/kennss/SpectArk/releases/tag/v1.1.4
 [1.1.3]: https://github.com/kennss/SpectArk/releases/tag/v1.1.3
 [1.1.1]: https://github.com/kennss/SpectArk/releases/tag/v1.1.1
