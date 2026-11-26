@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<!--
+  @file        1.2.1.html
+  @description Sparkle in-app release notes for SpectArk 1.2.1. Bundled into the appcast by
+               scripts/release.sh (copied next to the DMG as SpectArk-1.2.1.html so generate_appcast
+               attaches it). Rendered in the "Update Available" panel; styled for light and dark.
+               The full list is in CHANGELOG.md.
+  @author      Kennt Kim
+  @company     Calida Lab
+  @created     2026-11-26
+  @lastUpdated 2026-11-26
+-->
+<html>
+<head>
+<meta charset="utf-8" />
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    font: 13px -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif;
+    line-height: 1.5; margin: 0; padding: 14px 16px;
+    color: #1d1d1f; background: transparent;
+  }
+  h1 { font-size: 15px; font-weight: 700; margin: 0 0 4px; }
+  .sub { color: #86868b; font-size: 12px; margin: 0 0 12px; }
+  ul { margin: 0; padding-left: 18px; }
+  li { margin-bottom: 9px; }
+  b { font-weight: 600; }
+  @media (prefers-color-scheme: dark) {
+    body { color: #f5f5f7; }
+    .sub { color: #98989d; }
+  }
+</style>
+</head>
+<body>
+  <h1>SpectArk 1.2.1</h1>
+  <p class="sub">Deleted and renamed files can always be restored</p>
+  <ul>
+    <li><b>A file deleted or renamed soon after it was created can be restored.</b> A restore point
+        is kept at most every 15 minutes, and a file that appeared after the last one lived only in
+        the latest state: deleting it, renaming it or deleting its folder before the next restore
+        point left it in none at all. Now the state just before such a removal is always kept as a
+        restore point, for plain and encrypted backups, so the file comes back under its old name.
+        Edits within the 15 minutes are thinned as before.</li>
+  </ul>
+</body>
+</html>

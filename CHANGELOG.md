@@ -6,6 +6,8 @@ All notable changes to SpectArk are documented here. The format follows
 
 ## [Unreleased]
 
+## [1.2.1] — 2026-11-26
+
 ### Fixed
 - **A file deleted or renamed soon after it was created can be restored.** A restore point is kept at most
   every 15 minutes, and a file that appeared after the last one lived only in the latest state: deleting it,
@@ -239,6 +241,7 @@ the bundle id and existing backups carry over).
 - Dashboard window + menu-bar dropdown with live throughput and free space.
 - Developer ID signed and notarized; universal (Apple Silicon + Intel), macOS 14+.
 
+[1.2.1]: https://github.com/kennss/SpectArk/releases/tag/v1.2.1
 [1.2.0]: https://github.com/kennss/SpectArk/releases/tag/v1.2.0
 [1.1.4]: https://github.com/kennss/SpectArk/releases/tag/v1.1.4
 [1.1.3]: https://github.com/kennss/SpectArk/releases/tag/v1.1.3
