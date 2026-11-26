@@ -57,9 +57,10 @@ they go.
 
 - **Continuous protection with Time Machine–style restore points**: every change is backed up
   within seconds, and a restore point is kept at most every 15 minutes — all of the last 24 hours,
-  one per day for a month, one per week after that. Only changed files are copied; which folders
-  changed comes from the macOS file-system journal, including changes made while SpectArk was not
-  running.
+  one per day for a month, one per week after that. A file deleted or renamed in between can be
+  restored too: the state just before is kept as a restore point. Only changed files are copied; which
+  folders changed comes from the macOS file-system journal, including changes made while SpectArk
+  was not running.
 - **Realtime or scheduled** per backup — watch a folder live, or run on an interval.
 - **Multiple source folders**, each paired with any destination you choose.
 - **Local disk or NAS** destinations. A NAS backup lives in a disk image on the share, with its
