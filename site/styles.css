@@ -70,6 +70,10 @@ code {
 .nav__links a { color: var(--ink-dim); font-size: 14px; font-weight: 500; transition: color .15s; }
 .nav__links a:hover { color: var(--ink); }
 .nav__links + .btn { margin-left: 22px; }
+.nav__lang { display: flex; gap: 12px; font-size: 13px; font-weight: 500; margin-left: 22px; }
+.nav__lang a { color: var(--ink-faint); transition: color .15s; }
+.nav__lang a:hover { color: var(--ink); }
+.nav__lang a.is-active { color: var(--ink); font-weight: 700; }
 
 /* ---- BUTTONS ---- */
 .btn {
@@ -197,6 +201,7 @@ code {
 @media (max-width: 820px) {
   .nav { gap: 14px; }
   .nav__links { display: none; }
+  .nav__lang { gap: 9px; font-size: 12px; margin-left: auto; }
   .nav__links + .btn { margin-left: auto; }
   .nav__brand { margin-right: auto; }
   .feature { grid-template-columns: 1fr; gap: 26px; padding: 50px 24px; }

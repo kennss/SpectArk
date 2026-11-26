@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<!--
+  @file        ko/index.html
+  @description SpectArk Korean landing page (spectark.calidalab.ai/ko/). Written separately for 1.2.0,
+               not a translation of the English page. Static page; shares the dark brand styles
+               (blue + amber) in /styles.css.
+  @author      Kennt Kim
+  @company     Calida Lab
+  @created     2026-09-25
+  @lastUpdated 2026-11-26
+-->
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>SpectArk — 커밋 사이의 작업까지 지킵니다</title>
+  <meta name="description" content="지키고 싶은 폴더만 골라, 바뀌는 즉시 백업하는 macOS 앱. 모든 변경이 몇 초 안에 저장되고, Time Machine 방식 복원 지점이 최대 15분마다 남습니다. 외장 디스크든 NAS든, 원하면 종단 간 암호화까지. 무료 오픈소스." />
+  <link rel="icon" type="image/png" href="/assets/icon.png" />
+  <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+
+  <link rel="canonical" href="https://spectark.calidalab.ai/ko/" />
+  <link rel="alternate" hreflang="en" href="https://spectark.calidalab.ai/" />
+  <link rel="alternate" hreflang="ko" href="https://spectark.calidalab.ai/ko/" />
+  <link rel="alternate" hreflang="x-default" href="https://spectark.calidalab.ai/" />
+
+  <!-- Open Graph / social -->
+  <meta property="og:type" content="website" />
+  <meta property="og:title" content="SpectArk — 커밋 사이의 작업까지 지킵니다" />
+  <meta property="og:description" content="지키고 싶은 폴더만 골라, 바뀌는 즉시 백업하는 macOS 앱. 외장 디스크든 NAS든, 원하면 종단 간 암호화까지. 무료 오픈소스." />
+  <meta property="og:image" content="https://spectark.calidalab.ai/assets/icon.png" />
+  <meta property="og:url" content="https://spectark.calidalab.ai/ko/" />
+  <meta property="og:locale" content="ko_KR" />
+  <meta name="theme-color" content="#0c111b" />
+
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,600;12..96,800&family=Inter:wght@400;500;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/styles.css?v=2" />
+</head>
+<body>
+
+  <!-- NAV -->
+  <header class="nav">
+    <a class="nav__brand" href="#top" aria-label="SpectArk">
+      <img src="/assets/lockup-white.png" srcset="/assets/lockup-white.png 1x, /assets/lockup-white@2x.png 2x" alt="SpectArk" height="28" />
+    </a>
+    <nav class="nav__links">
+      <a href="#realtime">실시간</a>
+      <a href="#versions">복원 지점</a>
+      <a href="#anywhere">어디든</a>
+      <a href="#space">디스크</a>
+      <a href="#encryption">암호화</a>
+    </nav>
+    <div class="nav__lang"><a href="/">EN</a><a href="/ko/" class="is-active">한국어</a></div>
+    <a class="btn btn--small" href="#download">다운로드</a>
+  </header>
+
+  <!-- HERO -->
+  <main id="top">
+    <section class="hero">
+      <img class="hero__icon" src="/assets/icon.png" alt="SpectArk 앱 아이콘" width="128" height="128" />
+      <span class="badge"><span class="badge__spark">✦</span> 모든 변경을 몇 초 안에</span>
+      <h1 class="hero__title">커밋 사이의 작업까지<br /><span class="amber">지킵니다</span>.</h1>
+      <p class="hero__sub">
+        Git은 커밋한 것만, Time Machine은 한 시간 전 상태만 돌려줍니다. 정작 날아가는 건
+        <strong>방금까지 손대던 작업</strong>입니다. SpectArk는 지정한 폴더를 지켜보다가 파일이
+        바뀌면 몇 초 안에 백업하고, 되돌아갈 지점을 15분마다 남깁니다.
+      </p>
+      <div class="hero__cta">
+        <a class="btn btn--primary" href="https://github.com/kennss/SpectArk/releases/latest" target="_blank" rel="noopener">Mac용 다운로드</a>
+        <a class="btn btn--ghost" href="#realtime">어떻게 동작하나 ↓</a>
+      </div>
+      <p class="hero__note">macOS 14+ · Apple Silicon &amp; Intel · 무료 오픈소스(MIT)</p>
+    </section>
+
+    <!-- HERO SCREENSHOT -->
+    <section class="hero-shot" aria-label="Mac에서 실행 중인 SpectArk">
+      <div class="frame frame--wide">
+        <img src="/assets/screenshots/home-mac.png" alt="SpectArk 대시보드 — 백업 하나의 복원 지점 기록과 목적지 여유 공간"
+             onerror="this.closest('.hero-shot').remove()" />
+      </div>
+    </section>
+
+    <!-- FEATURE: REALTIME -->
+    <section id="realtime" class="feature">
+      <div class="feature__text">
+        <p class="kicker kicker--blue">실시간 백업</p>
+        <h2>저장하는 순간<br />이미 백업입니다.</h2>
+        <p>
+          지금 작업 중인 폴더를 지정해 두면 그걸로 끝입니다. 주기를 고르거나 백업 버튼을 누를 일이
+          없습니다. 바뀐 파일만 골라 복사하기 때문에, 파일 하나를 고쳤다고 폴더 전체를 다시 훑지
+          않습니다. 어느 폴더가 바뀌었는지는 macOS가 기록해 둔 파일 변경 기록에서 읽어옵니다.
+        </p>
+        <ul class="checks">
+          <li>변경이 몇 초 안에 백업됩니다 — 주기도, 빈틈도 없습니다</li>
+          <li>앱이 꺼져 있던 동안 바뀐 것도 다음에 켜면 따라잡습니다</li>
+          <li>원하면 정해진 간격으로만 돌릴 수도 있습니다</li>
+          <li>메뉴 막대에서 전송 속도·여유 공간·마지막 백업을 바로 봅니다</li>
+        </ul>
+      </div>
+      <figure class="feature__art art--blue">
+        <img src="/assets/screenshots/realtime.png" alt="SpectArk 메뉴 막대 — 백업별 마지막 실행 시각과 목적지 여유 공간"
+             onerror="this.closest('.feature__art').classList.add('feature__art--empty'); this.remove()" />
+      </figure>
+    </section>
+
+    <!-- FEATURE: RESTORE POINTS -->
+    <section id="versions" class="feature feature--reverse">
+      <div class="feature__text">
+        <p class="kicker kicker--amber">복원 지점</p>
+        <h2>어제 오후 3시로<br />돌아갈 수 있습니다.</h2>
+        <p>
+          복원 지점은 최대 15분마다 남습니다. 한참 손대지 않고 둔 상태에도 하나씩 남고,
+          직접 백업을 실행하면 그 순간도 남습니다. 오래된 기록은 Time Machine처럼 정리합니다.
+          최근 24시간은 전부, 한 달까지는 하루에 하나, 그 뒤로는 한 주에 하나씩입니다.
+        </p>
+        <ul class="checks">
+          <li>파일 단위로 골라서 되돌리거나, 폴더째 되돌립니다</li>
+          <li>같은 이름의 파일이 있을 때 어떻게 할지 고릅니다</li>
+          <li>최신 백업은 그냥 폴더입니다 — Finder에서 열어 바로 꺼내 씁니다</li>
+          <li>오래된 기록은 알아서 솎아내니 관리할 게 없습니다</li>
+        </ul>
+      </div>
+      <figure class="feature__art art--amber">
+        <img src="/assets/screenshots/versions.png" alt="복원 지점 기록 — 시각별로 남은 백업 목록"
+             onerror="this.closest('.feature__art').classList.add('feature__art--empty'); this.remove()" />
+      </figure>
+    </section>
+
+    <!-- FEATURE: ANY SOURCE → ANY DESTINATION -->
+    <section id="anywhere" class="feature">
+      <div class="feature__text">
+        <p class="kicker kicker--blue">필요한 것만, 원하는 곳에</p>
+        <h2>어떤 폴더든,<br />어떤 디스크든.</h2>
+        <p>
+          시스템 전체를 뜨지 않습니다. 백업 전용 디스크를 따로 비워 둘 필요도 없습니다.
+          다시 설치할 수 없는 폴더만 골라, 외장 SSD든 남는 파티션이든 NAS든 원하는 곳에
+          짝지으면 됩니다. NAS 백업도 앱 안에서 기록을 보고 그대로 되돌립니다.
+        </p>
+        <ul class="checks">
+          <li>원본 폴더 여러 개를 각각 다른 목적지에 붙일 수 있습니다</li>
+          <li>공유 폴더가 다른 이름으로 다시 연결돼도 알아서 찾아갑니다</li>
+          <li>다시 만들 수 있는 파일은 건너뜁니다 — node_modules, 빌드 결과물, 캐시</li>
+          <li>목적지에 맞는 저장 방식을 앱이 알아서 고릅니다</li>
+        </ul>
+      </div>
+      <figure class="feature__art art--learn">
+        <img src="/assets/screenshots/anywhere.png" alt="원본 폴더와 목적지를 짝짓는 화면"
+             onerror="this.closest('.feature__art').classList.add('feature__art--empty'); this.remove()" />
+      </figure>
+    </section>
+
+    <!-- FEATURE: DISK SPACE -->
+    <section id="space" class="feature feature--reverse">
+      <div class="feature__text">
+        <p class="kicker kicker--amber">디스크가 차도 멈추지 않습니다</p>
+        <h2>오래된 것부터<br />알아서 비웁니다.</h2>
+        <p>
+          백업 디스크는 언젠가 찹니다. 그때 백업이 멈춰 서면 지켜주는 게 없는 것과 같습니다.
+          SpectArk는 디스크의 5%를 늘 비워 두고, 모자라면 그 디스크에 있는 백업 전체에서
+          가장 오래된 복원 지점부터 지웁니다. Time Machine이 하는 방식 그대로입니다.
+        </p>
+        <ul class="checks">
+          <li>어느 백업 것이든 가리지 않고 오래된 순서로 정리합니다</li>
+          <li>각 백업의 최신 복원 지점은 절대 지우지 않습니다</li>
+          <li>비울 여유 공간은 직접 정할 수도 있습니다</li>
+          <li>공간이 모자라 멈춘 백업도 스스로 자리를 만들어 이어갑니다</li>
+        </ul>
+      </div>
+      <figure class="feature__art art--sources feature__art--empty"></figure>
+    </section>
+
+    <!-- FEATURE: ENCRYPTION -->
+    <section id="encryption" class="feature">
+      <div class="feature__text">
+        <p class="kicker kicker--blue">필요할 때만 켜는 종단 간 암호화</p>
+        <h2>백업이 유출 경로가<br />되어선 안 됩니다.</h2>
+        <p>
+          외장 디스크나 NAS는 잃어버릴 수도, 도난당할 수도 있습니다. 평문 백업은 그 안의 파일을
+          전부 넘겨주는 셈입니다. 그래서 백업마다 종단 간 암호화를 켤 수 있습니다. 비밀번호로만
+          열리고, 비상용으로 한 번만 보여주는 복구 키가 있습니다. 기본은 꺼져 있습니다.
+        </p>
+        <ul class="checks">
+          <li>AES-256-GCM, argon2id로 만든 키</li>
+          <li>내용 기반 분할과 중복 제거 — 암호화해도 용량은 아낍니다</li>
+          <li>복구 키가 있어 비밀번호를 잊어도 길이 남습니다</li>
+          <li>끄면 백업이 Finder에서 그대로 열리는 평범한 파일로 남습니다</li>
+        </ul>
+      </div>
+      <figure class="feature__art art--amber">
+        <img src="/assets/screenshots/encryption.png" alt="백업에 종단 간 암호화를 켜는 화면"
+             onerror="this.closest('.feature__art').classList.add('feature__art--empty'); this.remove()" />
+      </figure>
+    </section>
+
+    <!-- SMALL FEATURE GRID -->
+    <section class="grid">
+      <div class="grid__item">
+        <h3>망가뜨리지 않는 것이 먼저입니다</h3>
+        <p>모든 변경은 디스크를 건드리기 전에 기록부터 남깁니다. 중간에 끊겨도 다음 백업이 그 자리를 정리합니다. 복사한 파일은 원본과 대조하고, 읽는 동안 원본이 바뀌었다면 그 복사본은 버립니다. 반쯤 쓰인 파일이 백업에 남지 않습니다.</p>
+      </div>
+      <div class="grid__item">
+        <h3>온전히 내 것입니다</h3>
+        <p>무료 오픈소스(MIT)입니다. 계정도, 수집도, 클라우드도 없습니다. Developer ID로 서명하고 Apple 공증을 받았으며, 업데이트는 앱이 알아서 받습니다.</p>
+      </div>
+    </section>
+
+    <!-- PLATFORM -->
+    <section class="platforms">
+      <h2>Mac 앱 하나. 메뉴 막대와 대시보드.</h2>
+      <p class="platforms__sub">Apple Silicon과 Intel 모두 네이티브로 동작합니다.</p>
+      <div class="platforms__row">
+        <span class="chip">Apple Silicon</span>
+        <span class="chip">Intel</span>
+        <span class="chip">macOS 14+</span>
+      </div>
+    </section>
+
+    <!-- DOWNLOAD -->
+    <section id="download" class="download">
+      <h2>SpectArk 받기</h2>
+      <p>무료 오픈소스입니다. 서명·공증된 최신 DMG를 열어 SpectArk를 응용 프로그램 폴더로 끌어다 놓으면 끝입니다.</p>
+      <div class="download__btns">
+        <a class="btn btn--primary" href="https://github.com/kennss/SpectArk/releases/latest" target="_blank" rel="noopener">Mac용 다운로드</a>
+        <a class="btn btn--ghost" href="https://github.com/kennss/SpectArk/blob/main/README.ko.md" target="_blank" rel="noopener">GitHub에서 보기</a>
+      </div>
+      <p class="download__note">서명 &amp; 공증 · 유니버설 · macOS 14+ · 앱 내 자동 업데이트</p>
+    </section>
+  </main>
+
+  <!-- FOOTER -->
+  <footer class="footer">
+    <img src="/assets/wordmark-white.png" srcset="/assets/wordmark-white.png 1x, /assets/wordmark-white@2x.png 2x" alt="SpectArk" height="22" class="footer__mark" />
+    <p class="footer__desc">지키고 싶은 폴더만, 바뀌는 즉시, 되돌릴 수 있게. 원하면 종단 간 암호화까지.</p>
+    <p class="footer__meta">
+      <a href="https://github.com/kennss/SpectArk" target="_blank" rel="noopener">GitHub</a>
+      <span>·</span>
+      <a href="/privacy/">개인정보</a>
+      <span>·</span>
+      <a href="mailto:kenntkim66@gmail.com">kenntkim66@gmail.com</a>
+      <span>·</span>
+      <span>© 2026 Calida Lab</span>
+    </p>
+  </footer>
+
+</body>
+</html>
