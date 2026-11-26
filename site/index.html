@@ -3,17 +3,18 @@
   @file        index.html
   @description SpectArk landing page (spectark.calidalab.ai). Static, dark brand
                (blue + amber) shared across the Calida Lab / Specta product family.
+               Content follows the 1.2.x engine and README; same sections as /ko/.
   @author      Kennt Kim
   @company     Calida Lab
   @created     2026-07-05
-  @lastUpdated 2026-07-05
+  @lastUpdated 2026-11-26
 -->
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>SpectArk — Back up the moment it changes.</title>
-  <meta name="description" content="A native macOS incremental backup app. SpectArk watches the folders you actually care about and snapshots them the instant a file changes — versioned like Time Machine, to any disk or NAS, optionally end-to-end encrypted. Free & open source." />
+  <meta name="description" content="A native macOS backup app for the folders you care about. Every change is backed up within seconds, with Time Machine–style restore points at most every 15 minutes — to any disk or NAS, optionally end-to-end encrypted. Free & open source." />
   <link rel="icon" type="image/png" href="/assets/icon.png" />
   <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
 
@@ -44,8 +45,9 @@
     </a>
     <nav class="nav__links">
       <a href="#realtime">Realtime</a>
-      <a href="#versions">Versions</a>
+      <a href="#versions">Restore points</a>
       <a href="#anywhere">Anywhere</a>
+      <a href="#space">Disk</a>
       <a href="#encryption">Encryption</a>
     </nav>
     <div class="nav__lang"><a href="/" class="is-active">EN</a><a href="/ko/">한국어</a></div>
@@ -56,12 +58,13 @@
   <main id="top">
     <section class="hero">
       <img class="hero__icon" src="/assets/icon.png" alt="SpectArk app icon" width="128" height="128" />
-      <span class="badge"><span class="badge__spark">✦</span> Snapshots the instant a file changes</span>
+      <span class="badge"><span class="badge__spark">✦</span> Every change, within seconds</span>
       <h1 class="hero__title">Back up the moment<br />it <span class="amber">changes</span>.</h1>
       <p class="hero__sub">
-        SpectArk watches the folders you actually care about and snapshots them the
-        <strong>instant a file changes</strong> — versioned like Time Machine, to any disk or NAS,
-        optionally <strong>end-to-end encrypted</strong>. No schedule, no gap.
+        Git protects only what you've committed; Time Machine takes you back an hour. What gets lost
+        is <strong>the work you were just doing</strong>. SpectArk watches the folders you choose, backs
+        up each change within seconds, and keeps a restore point at most every 15 minutes — to any
+        disk or NAS, optionally <strong>end-to-end encrypted</strong>.
       </p>
       <div class="hero__cta">
         <a class="btn btn--primary" href="https://github.com/kennss/SpectArk/releases/latest" target="_blank" rel="noopener">Download for Mac</a>
@@ -73,7 +76,7 @@
     <!-- HERO SCREENSHOT -->
     <section class="hero-shot" aria-label="SpectArk on Mac">
       <div class="frame frame--wide">
-        <img src="/assets/screenshots/home-mac.png" alt="SpectArk on Mac — a realtime backup job showing live throughput, files this pass, and destination free space"
+        <img src="/assets/screenshots/home-mac.png" alt="SpectArk dashboard — a backup's restore point history and its destination's free space"
              onerror="this.closest('.hero-shot').remove()" />
       </div>
     </section>
@@ -84,15 +87,15 @@
         <p class="kicker kicker--blue">Realtime backup</p>
         <h2>The instant you<br />hit save.</h2>
         <p>
-          Point SpectArk at the folder you're actively working in and it snapshots the moment a file
-          changes — no schedule, no interval to tune. It closes the gap a scheduled backup always leaves,
-          and the one Git leaves too: your work <em>between</em> commits is safe the second you type it.
+          Point SpectArk at the folder you're working in and that's it — no schedule to pick, no button
+          to press. Only changed files are copied, so editing one file doesn't rescan the whole folder;
+          which folders changed comes from the macOS file-system journal.
         </p>
         <ul class="checks">
-          <li>Watches folders live with FSEvents — snapshots on change</li>
+          <li>Changes backed up within seconds — no schedule, no gap</li>
+          <li>Catches up on what changed while SpectArk wasn't running</li>
           <li>Or run on an interval, per backup — you choose</li>
           <li>Menu-bar app with live throughput, free space &amp; last backup</li>
-          <li>Resumes automatically if a backup is interrupted</li>
         </ul>
       </div>
       <figure class="feature__art art--blue">
@@ -101,25 +104,26 @@
       </figure>
     </section>
 
-    <!-- FEATURE: VERSIONED HISTORY -->
+    <!-- FEATURE: RESTORE POINTS -->
     <section id="versions" class="feature feature--reverse">
       <div class="feature__text">
-        <p class="kicker kicker--amber">Versioned history</p>
-        <h2>Every version,<br />browsable in Finder.</h2>
+        <p class="kicker kicker--amber">Restore points</p>
+        <h2>Go back to<br />3 p.m. yesterday.</h2>
         <p>
-          SpectArk keeps point-in-time snapshots the way Time Machine does — but only of the folders you
-          chose, so restoring is instant and the history stays small. Unchanged files are shared with
-          APFS clones and hardlinks, so a snapshot costs almost nothing.
+          A restore point is kept at most every 15 minutes, another for a state you leave standing, and
+          one whenever you run a backup yourself. Delete or rename a file and the state just before is
+          kept too, so the file comes back under its old name. Old history thins out the way Time
+          Machine's does: everything from the last 24 hours, one a day for a month, one a week after that.
         </p>
         <ul class="checks">
-          <li>Point-in-time snapshots, Time Machine style</li>
-          <li>Unchanged data shared via APFS clones / hardlinks — near-zero cost</li>
-          <li>Snapshots stay plain files — browse and restore right in Finder</li>
-          <li>Automatic thinning keeps the history tidy over time</li>
+          <li>Restore single files or whole folders</li>
+          <li>Choose what happens when a file already exists</li>
+          <li>On a local disk, the latest backup is a plain folder — open it in Finder and copy straight out</li>
+          <li>Old history thins itself — nothing to manage</li>
         </ul>
       </div>
       <figure class="feature__art art--amber">
-        <img src="/assets/screenshots/versions.png" alt="A snapshot history — point-in-time versions of a backed-up folder"
+        <img src="/assets/screenshots/versions.png" alt="A backup's restore point history — the states it can go back to"
              onerror="this.closest('.feature__art').classList.add('feature__art--empty'); this.remove()" />
       </figure>
     </section>
@@ -130,16 +134,15 @@
         <p class="kicker kicker--blue">Just what matters. Anywhere you like.</p>
         <h2>Any folder.<br />Any drive.</h2>
         <p>
-          No whole-system copy, no dedicated backup drive. Back up just the source code and projects you
-          can't reinstall, and pair any source folder with any destination — an external SSD, a spare
-          partition, or a NAS. SpectArk detects each destination's capabilities and picks the safe
-          strategy automatically.
+          No whole-system copy, no drive dedicated to backups. Pick the folders you can't reinstall and
+          pair each with any destination — an external SSD, a spare partition, or a NAS. A NAS backup
+          keeps its full timeline too, and restores right in the app.
         </p>
         <ul class="checks">
-          <li>Folder-scoped — back up what you can't re-download, skip the OS</li>
-          <li>Local disk or NAS (SMB) — strategy auto-detected per destination</li>
-          <li>Multiple source folders, each paired with its own destination</li>
-          <li>No drive dedicated to backups — snapshots live where you want</li>
+          <li>Several source folders, each paired with its own destination</li>
+          <li>Finds the share again even when macOS mounts it under another name</li>
+          <li>Skips rebuildable files — node_modules, build outputs, caches</li>
+          <li>Picks the right storage format for each destination</li>
         </ul>
       </div>
       <figure class="feature__art art--learn">
@@ -148,16 +151,36 @@
       </figure>
     </section>
 
-    <!-- FEATURE: ENCRYPTION -->
-    <section id="encryption" class="feature feature--reverse">
+    <!-- FEATURE: DISK SPACE -->
+    <section id="space" class="feature feature--reverse">
       <div class="feature__text">
-        <p class="kicker kicker--amber">Optional end-to-end encryption</p>
+        <p class="kicker kicker--amber">Never stops for a full disk</p>
+        <h2>Clears the oldest<br />first, on its own.</h2>
+        <p>
+          Every backup disk fills up eventually, and a backup that stops then protects nothing. SpectArk
+          keeps 5% of the disk free, and when it runs short, deletes the disk's oldest restore points
+          first — across all the backups on it, the way Time Machine does.
+        </p>
+        <ul class="checks">
+          <li>Oldest first, whichever backup it belongs to</li>
+          <li>Never deletes a backup's newest restore point</li>
+          <li>Set the free space to keep yourself</li>
+          <li>A backup stopped for lack of space makes room and carries on</li>
+        </ul>
+      </div>
+      <figure class="feature__art art--sources feature__art--empty"></figure>
+    </section>
+
+    <!-- FEATURE: ENCRYPTION -->
+    <section id="encryption" class="feature">
+      <div class="feature__text">
+        <p class="kicker kicker--blue">Optional end-to-end encryption</p>
         <h2>The backup shouldn't<br />become the leak.</h2>
         <p>
           A backup drive or NAS can be lost or stolen — and a plaintext copy hands over every file on it.
           So any backup can be encrypted end-to-end, unlocked only by your password, with a one-time
-          recovery key as a fallback. It's off by default: when you don't need it, snapshots stay
-          browsable plaintext.
+          recovery key as a fallback. It's off by default: when you don't need it, backups stay
+          plain files you can open in Finder.
         </p>
         <ul class="checks">
           <li>AES-256-GCM with argon2id-derived keys</li>
@@ -166,7 +189,7 @@
           <li>Opt-in per backup — plaintext stays browsable when you don't need it</li>
         </ul>
       </div>
-      <figure class="feature__art art--sources">
+      <figure class="feature__art art--amber">
         <img src="/assets/screenshots/encryption.png" alt="Turning on end-to-end encryption for a backup — AES-256-GCM with a one-time recovery key"
              onerror="this.closest('.feature__art').classList.add('feature__art--empty'); this.remove()" />
       </figure>
@@ -175,8 +198,8 @@
     <!-- SMALL FEATURE GRID -->
     <section class="grid">
       <div class="grid__item">
-        <h3>Built for correctness</h3>
-        <p>APFS source snapshots for consistent reads, <code>clonefile</code>/<code>copyfile</code>, atomic <code>rename</code> publish with a <code>COMPLETE</code> marker, and an <code>F_FULLFSYNC</code>-durable SQLite catalog. The filesystem is the source of truth.</p>
+        <h3>Safe before anything else</h3>
+        <p>Every change is logged in the catalog before it touches the disk, so an interrupted pass is repaired on the next one. Copies are <code>fsync</code>ed and put in place with an atomic <code>rename</code>, and the catalog commits with <code>F_FULLFSYNC</code>. Every copy is checked against its source and dropped if the file changed while it was read — a backup never holds a half-written file.</p>
       </div>
       <div class="grid__item">
         <h3>Yours, entirely</h3>
