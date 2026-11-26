@@ -8,9 +8,15 @@
 //  @author      Kennt Kim
 //  @company     Calida Lab
 //  @created     2026-06-30
-//  @lastUpdated 2026-09-19
+//  @lastUpdated 2026-11-26
 //
 //  Notes:
+//  - A pass that removes something the parent snapshot held — a file or symlink deleted, renamed away or
+//    replaced by another kind, a folder with files in it, a source dropped from the job — records the parent
+//    in `Snapshot.removedFrom`: the 15-minute cadence then never thins the parent, which may be the only
+//    snapshot holding what went (RepoMaintenance.cadenceThinned). Conservative: the removed item may also be
+//    in an earlier kept snapshot, and the parent is kept all the same (its data is shared, so it costs only
+//    its snapshot object).
 //  - Incremental (a pass): the previous pass's snapshot is the parent. A file whose size and exact mtime
 //    match its node there keeps that node, unread. A folder FSEvents reported nothing in (SourceScope) —
 //    and that is still the same folder (inode), with its subtree totals known — keeps its tree, unlisted.
@@ -139,6 +145,9 @@ struct DedupEngine: Sendable {
         }
         let walk = Walk(trees: trees, exclusions: exclusions, tolerant: tolerant,
                         quietWindow: incremental.quietWindow)
+        // A source dropped from the job removes everything it held.
+        let names = Set(sources.map(\.lastPathComponent))
+        if parentRoot.contains(where: { !names.contains($0.key) && Self.holdsContent($0.value) }) { walk.removed = true }
         var rootNodes: [TreeNode] = []
         var fileCount = 0
         var totalBytes = 0
@@ -168,7 +177,8 @@ struct DedupEngine: Sendable {
         let snapshot = Snapshot(rootTreeID: rootTreeID,
                                 sourcePath: sources.map(\.path).joined(separator: ", "),
                                 createdAt: now, fileCount: fileCount, totalBytes: totalBytes, origin: origin,
-                                requested: requested ? true : nil)
+                                requested: requested ? true : nil,
+                                removedFrom: walk.removed && parentSnapshot != nil ? incremental.parent : nil)
         let sealed = try cipher.sealMetadata(try Self.canonicalEncoder.encode(snapshot),
                                              context: "snapshots/\(snapshotID)")
         try await backend.put(key: "snapshots/\(snapshotID)", data: sealed)
@@ -204,6 +214,8 @@ struct DedupEngine: Sendable {
         let session: CoordinatedSourceSession
         var deferred = 0
         var carried: [String: Set<String>] = [:]
+        /// Something the parent snapshot held is not in this one (see the file notes).
+        var removed = false
 
         init(trees: TreeReader, exclusions: BackupExclusions, tolerant: Bool, quietWindow: TimeInterval) {
             self.trees = trees
@@ -242,8 +254,12 @@ struct DedupEngine: Sendable {
         }
         // What the parent had here, by name: unchanged files keep their nodes.
         var before: [String: TreeNode] = [:]
-        if let treeID = previous?.treeID, let nodes = try? await walk.trees.nodes(treeID) {   // unreadable: read all
-            for node in nodes { before[node.name] = node }
+        if let treeID = previous?.treeID {
+            if let nodes = try? await walk.trees.nodes(treeID) {
+                for node in nodes { before[node.name] = node }
+            } else {
+                walk.removed = true   // unreadable: everything is read, and what went is unknown
+            }
         }
         // Another folder in its place: nothing below it can be reused unlisted.
         let listBelow = listAll || (previous != nil && !sameFolder)
@@ -361,8 +377,19 @@ struct DedupEngine: Sendable {
             if let old { nodes[index] = old; fileCount += 1; bytes += old.size ?? 0 }
         }
 
-        let treeID = try await writeTree(nodes.compactMap { $0 })
+        let written = nodes.compactMap { $0 }
+        if !walk.removed {
+            let kinds = Dictionary(written.map { ($0.name, $0.kind) }, uniquingKeysWith: { first, _ in first })
+            walk.removed = before.values.contains { old in kinds[old.name] != old.kind && Self.holdsContent(old) }
+        }
+        let treeID = try await writeTree(written)
         return TreeNode(kind: .directory, name: name, treeID: treeID, ino: ino, fileCount: fileCount, totalBytes: bytes)
+    }
+
+    /// A node whose going loses something: a file, a symlink, or a folder with files below it (or whose
+    /// count is unknown — a node from before subtree totals existed).
+    private static func holdsContent(_ node: TreeNode) -> Bool {
+        node.kind != .directory || (node.fileCount ?? 1) > 0
     }
 
     private struct SealedFile: Sendable {

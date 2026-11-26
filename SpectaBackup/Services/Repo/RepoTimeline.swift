@@ -7,7 +7,7 @@
 //  @author      Kennt Kim
 //  @company     Calida Lab
 //  @created     2026-09-19
-//  @lastUpdated 2026-09-19
+//  @lastUpdated 2026-11-26
 //
 //  Notes:
 //  - Nothing of the timeline is written at the destination in the clear (no catalog there any more — on a
@@ -40,6 +40,8 @@ struct RepoSnapshotSummary: Codable, Equatable, Sendable {
     let origin: String?
     /// An explicit restore point (Snapshot.requested).
     var requested: Bool?
+    /// The snapshot whose state this one's pass removed something from (Snapshot.removedFrom).
+    var removedFrom: String?
 }
 
 /// Where the next encrypted pass starts (DedupEngine.Incremental): the snapshot the last pass wrote, the
@@ -116,7 +118,7 @@ struct RepoTimeline: Sendable {
             }
             let summary = RepoSnapshotSummary(id: id, createdAt: snapshot.createdAt, fileCount: snapshot.fileCount,
                                               totalBytes: snapshot.totalBytes, origin: snapshot.origin,
-                                              requested: snapshot.requested)
+                                              requested: snapshot.requested, removedFrom: snapshot.removedFrom)
             added[id] = summary
             result.snapshots.append(summary)
         }

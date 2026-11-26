@@ -2,15 +2,22 @@
 //  @file        CaptureEngine.swift
 //  @description One capture pass of the history engine: bring the mirror (current/) up to date with the
 //               source, moving superseded versions that some checkpoint contains into versions/, and
-//               seal a checkpoint when the 15-minute spacing allows. Every filesystem change is logged
+//               seal a checkpoint when the 15-minute spacing allows (or a removal would lose a file no
+//               checkpoint holds). Every filesystem change is logged
 //               as an intent first, so an interrupted pass is repaired on the next open.
 //               Design: docs/INCREMENTAL_ENGINE_DESIGN.md §3.2–3.5.
 //  @author      Kennt Kim
 //  @company     Calida Lab
 //  @created     2026-09-18
-//  @lastUpdated 2026-09-19
+//  @lastUpdated 2026-11-26
 //
 //  Notes:
+//  - A pass about to remove a file (or symlink) that no checkpoint holds — one that entered current/ after
+//    the last checkpoint, deleted, renamed away or replaced by a folder before the next — first seals the
+//    state the previous pass left, whatever the spacing (docs §3.3.4): unlinked, it would be in no restore
+//    point at all, although the latest state showed it. Replacing such a file does not seal: an
+//    intermediate version between checkpoints is not history (§3.2). Not when the previous pass never
+//    finished (`passLeftOpen`): that state never matched the source, so no restore point can hold it.
 //  - What to compare comes from the FSEvents journal (ChangeJournal): only directories whose contents
 //    changed since the stored cursor, one level each. A full walk happens without a usable cursor, when
 //    the source folder is no longer the verified directory (inode), after a settings or rules change,
@@ -64,7 +71,8 @@ struct CaptureOutcome: Sendable {
     /// Changed files left for a later pass because they were still being written (quiet window).
     let deferredCount: Int
     let bytesCopied: Int64
-    /// Checkpoints sealed by this pass, oldest first (at most two: a leftover state, then this one).
+    /// Checkpoints sealed by this pass, oldest first (at most two: the state before this pass — left standing,
+    /// or about to lose a file no checkpoint holds — then this one).
     let sealed: [HistoryCheckpoint]
     /// Intents of an interrupted earlier pass that this pass settled first.
     let recoveredIntents: Int
@@ -155,6 +163,13 @@ struct CaptureEngine: Sendable {
         let start = now()
         let scope = try discover(job: job, store: store, hints: journalHints, now: start)
         let plan = try makePlan(job: job, scope: scope, store: store, quietWindow: quietWindow)
+        // Removing a file no checkpoint holds would lose it: the state before this pass is sealed first, so
+        // the removal retires it into versions/ (docs §3.3.4). That state is the previous pass's end, when
+        // current/ matched the source.
+        if try !store.passLeftOpen(), try store.hasUnsealedChanges(),
+           plan.removesUnsealedFile(pendingGeneration: try store.pendingGeneration()) {
+            sealed.append(try store.seal(at: try store.lastPassEnd() ?? start))
+        }
         var stats = ApplyStats()
         if !plan.operations.isEmpty { try store.beginPass() }
         let batches = stride(from: 0, to: plan.operations.count, by: Self.batchSize).map {
@@ -312,6 +327,15 @@ struct CaptureEngine: Sendable {
         var comparedDirectories = 0
         /// Directories whose whole subtree was compared: catalog path → source inode.
         var verifiedDirectories: [String: UInt64] = [:]
+
+        /// The plan removes a file or symlink born in `pendingGeneration`: one no checkpoint holds, which the
+        /// removal would unlink. Folders hold no content of their own; their files are removals too.
+        func removesUnsealedFile(pendingGeneration: Int64) -> Bool {
+            operations.contains { op in
+                guard case let .remove(entry) = op else { return false }
+                return entry.kind != .directory && entry.born == pendingGeneration
+            }
+        }
     }
 
     private func makePlan(job: BackupJob, scope: Scope, store: HistoryStore, quietWindow: TimeInterval) throws -> Plan {

@@ -6,6 +6,13 @@ All notable changes to SpectArk are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+- **A file deleted or renamed soon after it was created can be restored.** A restore point is kept at most
+  every 15 minutes, and a file that appeared after the last one lived only in the latest state: deleting it,
+  renaming it or deleting its folder before the next restore point left it in none at all (#1). Now the
+  state just before such a removal is always kept as a restore point, for plain and encrypted backups, so
+  the file can be restored under its old name. Edits within the 15 minutes are thinned as before.
+
 ## [1.2.0] — 2026-09-19
 
 ### Changed

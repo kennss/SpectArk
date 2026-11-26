@@ -5,13 +5,14 @@
 //               snapshot yet counts as a backup; a file in its quiet window keeps its previous version until a
 //               settle pass takes it; a requested restore point is written even when nothing changed; the
 //               15-minute cadence keeps the first snapshot once spacing has elapsed, each state left alone and
-//               the newest, never a requested or migrated one; a scope lists exactly the folders FSEvents
+//               the newest, never a requested or migrated one, and every state a later pass removed something
+//               from (a pass records it when it removes, not when it edits); a scope lists exactly the folders FSEvents
 //               reported, those on the way, and everything under a recursive report; the timeline shows
 //               what the repo occupies.
 //  @author      Kennt Kim
 //  @company     Calida Lab
 //  @created     2026-09-19
-//  @lastUpdated 2026-09-19
+//  @lastUpdated 2026-11-26
 //
 
 import Darwin
@@ -127,6 +128,38 @@ final class EncryptedIncrementalTests: XCTestCase {
         XCTAssertEqual(ids.count, 2, "both asked for; the cadence thins neither")
     }
 
+    /// Every snapshot of the repo, by ID, as the timeline reads them.
+    private func summaries() async throws -> [String: RepoSnapshotSummary] {
+        let backend = try LocalBackend(root: repoRoot)
+        let keys = try await RepoManager.unlock(backend: backend, password: Data("pw".utf8)).keys
+        let timeline = RepoTimeline(directory: fixture.root.appendingPathComponent("summaries-\(UUID().uuidString)",
+                                                                                  isDirectory: true))
+        let listed = try await timeline.snapshots(jobID: job.id, backend: backend, keys: keys)
+        return Dictionary(uniqueKeysWithValues: listed.map { ($0.id, $0) })
+    }
+
+    func testAPassThatRemovesAFileNamesTheStateItRemovedItFrom() async throws {
+        let runner = runner()
+        _ = try await runner.run(job: job) { _ in }
+        let afterFirst = try await snapshotIDs(runner)
+        let first = try XCTUnwrap(afterFirst.first)
+        try fixture.write("a.txt", "beta!")
+        fixture.waitForEvents()
+        _ = try await runner.run(job: job) { _ in }
+        let afterEdit = try await snapshotIDs(runner)
+        let edited = try XCTUnwrap(afterEdit.first)
+        try fixture.delete("sub")
+        fixture.waitForEvents()
+        _ = try await runner.run(job: job) { _ in }
+        let afterRemoval = try await snapshotIDs(runner)
+        let removed = try XCTUnwrap(afterRemoval.first)
+
+        let listed = try await summaries()
+        XCTAssertNil(listed[edited]?.removedFrom, "an edit removes nothing")
+        XCTAssertNotEqual(edited, first)
+        XCTAssertEqual(listed[removed]?.removedFrom, edited, "the folder and its file went")
+    }
+
     // MARK: - Cadence
 
     private func summary(_ id: String, _ time: Double, requested: Bool = false, origin: String? = nil) -> RepoSnapshotSummary {
@@ -141,6 +174,14 @@ final class EncryptedIncrementalTests: XCTestCase {
         // a: first. b, c: a burst within 15 minutes. d: spacing elapsed since a. e: left alone until f.
         // f: spacing elapsed. g: newest.
         XCTAssertEqual(dropped, [1, 2])
+    }
+
+    func testTheCadenceKeepsEveryStateALaterPassRemovedSomethingFrom() {
+        var d = summary("d", 180)
+        d.removedFrom = "c"
+        let ordered = [summary("a", 0), summary("b", 60), summary("c", 120), d, summary("e", 240)]
+        // c: the only state holding what d's pass removed. b, d: a burst within 15 minutes. e: newest.
+        XCTAssertEqual(RepoMaintenance.cadenceThinned(ordered, spacing: 900), [1, 3])
     }
 
     func testTheCadenceNeverThinsRequestedOrMigratedSnapshots() {

@@ -9,7 +9,7 @@
 //  @author      Kennt Kim
 //  @company     Calida Lab
 //  @created     2026-06-30
-//  @lastUpdated 2026-09-19
+//  @lastUpdated 2026-11-26
 //
 
 import Foundation
@@ -53,4 +53,8 @@ struct Snapshot: Codable, Sendable {
     var origin: String?
     /// An explicit restore point (Back Up Now, a due schedule): never thinned by the 15-minute cadence.
     var requested: Bool?
+    /// The parent snapshot, when this pass removed something it held (DedupEngine): the cadence never thins
+    /// that one, which may be the only restore point holding what went. Absent in snapshots written before it
+    /// existed.
+    var removedFrom: String?
 }

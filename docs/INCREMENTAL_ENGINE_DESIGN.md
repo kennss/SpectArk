@@ -91,6 +91,9 @@ pass briefly above it).
     `[born, g)`;
   - `born == g` (it appeared after the last checkpoint and is superseded before the next) → unlink
     it. Intermediate versions between checkpoints are not history, exactly like Time Machine.
+  - A **removal** of such an item (a file or symlink deleted, renamed away, or replaced by a folder) would
+    leave it in no restore point at all, although the latest state showed it: the pass seals first
+    (§3.3.4), so the item has `born < g` and is retired like any other.
 - The state at checkpoint `c` is `entries(born ≤ c) ∪ versions(born ≤ c < died)` — reconstructed from
   the catalog, never materialised unless restored.
 
@@ -103,9 +106,17 @@ pass briefly above it).
    `now − lastCheckpoint ≥ spacing` → seal them at the end time of that previous pass. This preserves
    a state that stood unchanged for a long time (edited at 10:05, next edit at 11:00) without a timer.
 3. "Back Up Now" seals at the end of its pass regardless of spacing — an explicit restore point.
+4. Before applying anything, regardless of spacing: if the plan removes a file or symlink born in the
+   pending generation, and the previous pass finished (not `pass_open`) leaving unsealed changes → seal
+   them at the end time of that previous pass. A deleted or renamed file is then always restorable from
+   the state just before (issue #1: a file created and deleted within one 15-minute window was in no
+   restore point). Replacing such a file does not seal (an intermediate version), nor does removing one
+   a checkpoint already holds. A previous pass that never finished leaves a state that never matched the
+   source: it is not sealed, and a file it alone held can still go.
 
 Result: at most one checkpoint per 15 minutes while you keep working, plus one for each state that was
-then left alone; nothing is recorded while nothing changes.
+then left alone and one before each removal of a file no checkpoint holds; nothing is recorded while
+nothing changes.
 
 ### 3.4 Capture pass
 
@@ -261,7 +272,11 @@ password) — no catalog at the destination.
 - **Cadence.** Every pass that changed something writes a snapshot, so changes are protected at once; a pass
   that changed nothing writes none (unless the restore point was requested). Retention then keeps a restore
   point at most every 15 minutes (§3.3): the first once spacing has elapsed, each state left alone, the
-  newest, and every requested or migrated one.
+  newest, every requested or migrated one, and every state a later pass removed something from (§3.3.4).
+  A pass that removes a file, a symlink, a folder with files in it or a whole source records its parent
+  in `Snapshot.removedFrom`. Unlike the history engine this cannot tell whether an earlier kept snapshot
+  holds the removed item too, so it keeps the parent whenever something goes — costing a snapshot
+  object, not data, which the snapshots share.
 - **Retention and GC** (RepoMaintenance): the job's policy over the remaining snapshots, space rules with
   exact per-snapshot freed bytes; dropped snapshots' data is collected (dead packs deleted, packs a quarter
   dead rewritten, dead trees deleted) at most daily unless space is short, in an order an interruption can

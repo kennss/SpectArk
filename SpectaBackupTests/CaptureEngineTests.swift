@@ -3,12 +3,14 @@
 //  @description History engine, phase 1: the mirror follows the source; checkpoint sealing (15-minute
 //               spacing, sealing a state left standing, Back Up Now); only versions that a checkpoint
 //               contains are kept and every checkpoint reconstructs exactly; deletions, kind changes and
-//               newly excluded artifacts; a source file vanishing mid-pass; and crash recovery at every
+//               newly excluded artifacts; a file no checkpoint holds yet, deleted, renamed or moved away
+//               with its folder, seals the state before it first (an edit of one does not, nor does deleting
+//               a file a checkpoint holds); a source file vanishing mid-pass; and crash recovery at every
 //               filesystem step of put/add/remove, after which disk and catalog agree.
 //  @author      Kennt Kim
 //  @company     Calida Lab
 //  @created     2026-09-18
-//  @lastUpdated 2026-09-18
+//  @lastUpdated 2026-11-26
 //
 
 import Darwin
@@ -138,6 +140,61 @@ final class CaptureEngineTests: XCTestCase {
         XCTAssertNil(mirror("b.txt"))
         XCTAssertEqual(try files(at: 1)["src/b.txt"], "bravo")
         XCTAssertNil(try files(at: 2)["src/b.txt"])
+        try assertConsistent()
+    }
+
+    func testDeletingFilesNoCheckpointHoldsSealsTheStateBeforeThem() throws {
+        try write("a.txt", "alpha")
+        try pass(at: 0)                                   // checkpoint 1
+        try write("new.txt", "fresh")
+        try write("folder/inside.txt", "nested")
+        XCTAssertTrue(try pass(at: 2).sealed.isEmpty)     // only the latest state holds them
+        try delete("new.txt")
+        try delete("folder")
+        let outcome = try pass(at: 4)
+
+        XCTAssertEqual(outcome.sealed.map(\.seq), [2], "the state before the deletion is a restore point")
+        XCTAssertEqual(outcome.sealed.first?.time, t0.addingTimeInterval(2 * 60), "as the pass that produced it left it")
+        XCTAssertNil(mirror("new.txt"))
+        XCTAssertEqual(try files(at: 2), ["src/a.txt": "alpha", "src/new.txt": "fresh", "src/folder/inside.txt": "nested"])
+        try assertConsistent()
+    }
+
+    func testRenamingAFileNoCheckpointHoldsKeepsItsOldName() throws {
+        try write("a.txt", "alpha")
+        try pass(at: 0)
+        try write("draft.txt", "words")
+        try pass(at: 2)
+        try fixture.rename("draft.txt", to: "final.txt")
+        XCTAssertEqual(try pass(at: 4).sealed.map(\.seq), [2])
+
+        XCTAssertEqual(try files(at: 2)["src/draft.txt"], "words")
+        XCTAssertNil(try files(at: 2)["src/final.txt"])
+        XCTAssertEqual(mirror("final.txt"), "words", "the latest state has the new name")
+        XCTAssertNil(mirror("draft.txt"))
+        try assertConsistent()
+    }
+
+    func testEditingAFileNoCheckpointHoldsDoesNotSeal() throws {
+        try write("a.txt", "alpha")
+        try pass(at: 0)
+        try write("new.txt", "n1")
+        try pass(at: 2)
+        try write("new.txt", "n2-")
+        XCTAssertTrue(try pass(at: 4).sealed.isEmpty, "an intermediate version is not history")
+        XCTAssertTrue(try store().versions(of: "src/new.txt").isEmpty)
+        try assertConsistent()
+    }
+
+    func testDeletingAFileACheckpointHoldsDoesNotSeal() throws {
+        try write("a.txt", "v1")
+        try write("b.txt", "bravo")
+        try pass(at: 0)                                   // checkpoint 1 holds b.txt
+        try write("a.txt", "v2-")
+        try pass(at: 2)                                   // an unsealed change
+        try delete("b.txt")
+        XCTAssertTrue(try pass(at: 4).sealed.isEmpty, "b.txt is kept by checkpoint 1 already")
+        XCTAssertEqual(try files(at: 1)["src/b.txt"], "bravo")
         try assertConsistent()
     }
 

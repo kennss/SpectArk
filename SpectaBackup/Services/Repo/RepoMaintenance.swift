@@ -10,12 +10,13 @@
 //  @author      Kennt Kim
 //  @company     Calida Lab
 //  @created     2026-09-19
-//  @lastUpdated 2026-09-19
+//  @lastUpdated 2026-11-26
 //
 //  Notes:
 //  - Never the newest snapshot. Every pass writes a snapshot (its changes are protected at once); the
 //    history engine's 15-minute cadence then keeps a restore point at most every 15 minutes, plus each state
-//    that was left alone (cadenceThinned), before the policy applies.
+//    that was left alone, and each state a later pass removed something from (cadenceThinned), before the
+//    policy applies.
 //  - What dropping a snapshot frees is exact: the blobs no kept snapshot references any more, counted per
 //    distinct snapshot. Blobs and trees are numbered and each snapshot's references kept as a bitset, so a
 //    large repo costs a few MB rather than a copy of every ID per snapshot. Sizes are ciphertext lengths.
@@ -258,15 +259,18 @@ struct RepoMaintenance: Sendable {
 
     /// The history engine's cadence (docs §3.3): of the snapshots passes wrote, kept are the first once
     /// `spacing` has elapsed since the last one kept, the last before the source was left alone for
-    /// `spacing` (a state that stood), and the newest; the others — intermediate states of a burst of work —
-    /// go. Explicit restore points (Back Up Now) and migrated ones are never thinned here. Positions in
-    /// `ordered` (oldest first).
+    /// `spacing` (a state that stood), each state a later pass removed something from (`removedFrom`: it may be
+    /// the only one holding what went — docs §3.3.4), and the newest; the others — intermediate states of a
+    /// burst of work — go. Explicit restore points (Back Up Now) and migrated ones are never thinned here.
+    /// Positions in `ordered` (oldest first).
     static func cadenceThinned(_ ordered: [RepoSnapshotSummary],
                                spacing: TimeInterval = CaptureEngine.checkpointSpacing) -> Set<Int> {
         var dropped = Set<Int>()
         var lastKept: Double?
+        let removedFrom = Set(ordered.compactMap(\.removedFrom))
         for (index, snapshot) in ordered.enumerated() {
             let exempt = snapshot.requested == true || snapshot.origin != nil || index == ordered.count - 1
+                || removedFrom.contains(snapshot.id)
             let stood = index + 1 < ordered.count && ordered[index + 1].createdAt - snapshot.createdAt >= spacing
             let spaced = lastKept.map { snapshot.createdAt - $0 >= spacing } ?? true
             if exempt || stood || spaced { lastKept = snapshot.createdAt } else { dropped.insert(index) }
